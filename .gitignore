@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.cache/
+.tmp/
+.DS_Store
+*.log
+src/generated-worker.ts
+.env
+.env.*
