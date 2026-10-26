@@ -1,5 +1,6 @@
 import type { PixelImage, RenderRequest, RenderResult, ShapeId } from '../types';
 import { featherProtection, softenMonotoneMap } from './softenMap';
+import { createLocalMapper } from './localWarp';
 
 /** The small analysis image retains a two-dimensional map to the immutable original.
  * Seam removal/insertion changes this map; the final pass samples the original pixels.
@@ -358,6 +359,51 @@ export function renderImage(request: RenderRequest, onProgress?: (progress: numb
   const cdf = new Float32Array(grid.w), weights = new Float32Array(grid.w);
   const softMask = softness > 0 && hasProtection && shape !== 'rect' ? featherProtection(grid.mask, grid.w, grid.h, softness) : undefined;
   let shapeConflict = false;
+  // Local operations are expressed on the visible output. Invert them BEFORE
+  // evaluating shape and seam maps, then sample the immutable original once.
+  // Use requested dimensions so preview/export have identical physical angles.
+  const localMapper = createLocalMapper(request.localEdits, settings.width, settings.height);
+  const localPoint = { x: 0, y: 0 };
+  const localCDFs = new Map<number, Float32Array>();
+  const localProtected = hasProtection && strength > 0 && shape !== 'rect' && squeeze > 0 && grid.w > 1;
+  function cdfAtRow(row: number): Float32Array {
+    const cached = localCDFs.get(row); if (cached) return cached;
+    const rowCDF = new Float32Array(grid.w);
+    const spans = intervalsAt(shape, (row + 0.5) / outputHeight, points);
+    const occupied = spans.reduce((sum, [a, b]) => sum + b - a, 0);
+    const gy = outputHeight === 1 ? (grid.h - 1) / 2 : row * (grid.h - 1) / (outputHeight - 1);
+    shapeConflict = shapeCDF(grid, gy, occupied, strength, rowCDF, weights, softMask) || shapeConflict;
+    localCDFs.set(row, rowCDF); return rowCDF;
+  }
+  function localShapeX(px: number, py: number): number {
+    if (shape === 'rect') return px;
+    const sourceRow = py * Math.max(0, outputHeight - 1);
+    const spans = intervalsAt(shape, (sourceRow + 0.5) / outputHeight, points);
+    const occupied = spans.reduce((sum, [a, b]) => sum + b - a, 0);
+    if (!spans.length || occupied < 1e-9) return px;
+    // Keep the user's chosen outer silhouette. A local pull beyond that
+    // silhouette reaches its nearest edge instead of creating internal holes.
+    const query = (px * Math.max(0, outputWidth - 1) + 0.5) / outputWidth;
+    let arc = 0, closest = Infinity, selected = 0;
+    for (const [a, b] of spans) {
+      const within = clamp(query, a, b), distance = Math.abs(query - within);
+      if (distance < closest) { closest = distance; selected = arc + within - a; }
+      arc += b - a;
+    }
+    let shaped = clamp(selected / occupied, 0, 1);
+    if (localProtected) {
+      const row0 = Math.floor(sourceRow), row1 = Math.min(row0 + 1, outputHeight - 1), fraction = sourceRow - row0;
+      const c0 = cdfAtRow(row0), c1 = cdfAtRow(row1);
+      let lo = 0, hi = grid.w - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (lerp(c0[mid], c1[mid], fraction) < shaped) lo = mid; else hi = mid;
+      }
+      const left = lerp(c0[lo], c1[lo], fraction), right = lerp(c0[hi], c1[hi], fraction);
+      shaped = (lo + (shaped - left) / Math.max(1e-7, right - left)) / (grid.w - 1);
+    }
+    return lerp(px, clamp(shaped, 0, 1), squeeze);
+  }
   for (let y = 0; y < outputHeight; y++) {
     const gy = outputHeight === 1 ? (grid.h - 1) / 2 : y * (grid.h - 1) / (outputHeight - 1);
     const spans = intervalsAt(shape, (y + 0.5) / outputHeight, points);
@@ -378,7 +424,16 @@ export function renderImage(request: RenderRequest, onProgress?: (progress: numb
           shaped = (cdfIndex + (shaped - cdf[cdfIndex]) / Math.max(0.0000001, cdf[cdfIndex + 1] - cdf[cdfIndex])) / (grid.w - 1);
         }
         const nx = shape === 'rect' ? base : lerp(base, shaped, squeeze);
-        sampleMap(grid, nx * (grid.w - 1), gy, image, out, (y * outputWidth + x) * 4, coverage, widthStage);
+        let sampleX = nx * (grid.w - 1), sampleY = gy;
+        if (localMapper.active) {
+          const baseY = outputHeight === 1 ? 0.5 : y / (outputHeight - 1);
+          localMapper.map(base, baseY, localPoint);
+          if (Math.abs(localPoint.x - base) > 1e-12 || Math.abs(localPoint.y - baseY) > 1e-12) {
+            const px = clamp(localPoint.x, 0, 1), py = clamp(localPoint.y, 0, 1);
+            sampleX = localShapeX(px, py) * (grid.w - 1); sampleY = py * (grid.h - 1);
+          }
+        }
+        sampleMap(grid, sampleX, sampleY, image, out, (y * outputWidth + x) * 4, coverage, widthStage);
       }
       arcBefore += b - a;
     }

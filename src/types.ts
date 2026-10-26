@@ -1,5 +1,6 @@
+import type { LocalEdit } from './localTypes';
 export type ShapeId = 'rect' | 'ellipse' | 'triangle' | 'diamond' | 'hexagon' | 'star' | 'heart';
-export type Tool = 'transform' | 'protect' | 'compress' | 'erase' | 'rectangle';
+export type Tool = 'transform' | 'local' | 'protect' | 'compress' | 'erase' | 'rectangle';
 export type Quality = 'draft' | 'balanced' | 'fine';
 export interface PixelImage { width: number; height: number; data: Uint8ClampedArray; }
 export interface EditSettings {
@@ -20,6 +21,7 @@ export interface RenderRequest {
   maskHeight: number;
   settings: EditSettings;
   maxOutputEdge?: number;
+  localEdits?: LocalEdit[];
 }
 export interface RenderResult {
   image: PixelImage;

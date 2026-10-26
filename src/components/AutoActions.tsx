@@ -48,7 +48,7 @@ export default function AutoActions({ busy, disabled, info, protectRatio, compre
     </button>
     <div className="auto-secondary-row">
       <button className="auto-secondary" type="button" onClick={onAnalyze} disabled={unavailable}><SelectionIcon /><span>仅识别选区</span></button>
-      <button className="auto-secondary" type="button" onClick={onEdit} disabled={unavailable || !hasMask}><EditIcon /><span>查看 / 微调</span></button>
+
     </div>
     {busy ? <div className="auto-working">
       <div className="auto-working-header"><span role="status">{progress.label || '正在分析画面'}</span><button type="button" onClick={onCancel}>取消</button></div>
@@ -59,6 +59,6 @@ export default function AutoActions({ busy, disabled, info, protectRatio, compre
       <div className="auto-coverage" aria-hidden="true"><span className="auto-coverage-protect" style={{ width: `${protect * 100}%` }} /><span className="auto-coverage-compress" style={{ width: `${compress * 100}%` }} /></div>
     </div> : null}
     {warning && !busy ? <p className="auto-warning"><svg aria-hidden="true" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.3"><circle cx="8" cy="8" r="5.6" /><path d="M8 4.7v3.7" /><circle cx="8" cy="10.8" r=".4" fill="currentColor" /></svg><span>{warning}</span></p> : null}
-    <p id="auto-explanation" className="auto-explanation">自动寻找保护与压缩区域。<br />保留当前形状、挤压强度和柔和度。</p>
+    <p id="auto-explanation" className="auto-explanation">优先保护人物，保守压缩背景。<br />保留当前形状、挤压强度和柔和度。</p>
   </div>;
 }

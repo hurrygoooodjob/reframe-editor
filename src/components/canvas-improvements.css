@@ -1,0 +1,24 @@
+/* Canvas-specific overrides keep all eight resize handles touchable at every size. */
+.niuniu-canvas .resize-handle { width: 44px; height: 44px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.niuniu-canvas .resize-handle::after { content: ''; position: absolute; left: 17px; top: 17px; width: 10px; height: 10px; border: 1px solid #234b7d; border-radius: 2px; background: linear-gradient(#fff, #cbd6e5); box-shadow: 0 1px 3px #0006; }
+.niuniu-canvas .resize-handle:focus-visible { outline: 2px solid #bfe0ff; outline-offset: 0; border-radius: 6px; }
+.niuniu-canvas .resize-handle.n { top: -27px; left: calc(50% - 22px); cursor: ns-resize; }
+.niuniu-canvas .resize-handle.s { bottom: -27px; left: calc(50% - 22px); top: auto; cursor: ns-resize; }
+.niuniu-canvas .resize-handle.e { right: -27px; top: calc(50% - 22px); cursor: ew-resize; }
+.niuniu-canvas .resize-handle.w { left: -27px; top: calc(50% - 22px); cursor: ew-resize; }
+.niuniu-canvas .resize-handle.nw { left: -27px; top: -27px; cursor: nwse-resize; }
+.niuniu-canvas .resize-handle.ne { right: -27px; top: -27px; cursor: nesw-resize; }
+.niuniu-canvas .resize-handle.sw { left: -27px; bottom: -27px; cursor: nesw-resize; }
+.niuniu-canvas .resize-handle.se { right: -27px; bottom: -27px; cursor: nwse-resize; }
+.niuniu-canvas.is-local-editing .canvas-wrap { cursor: crosshair; }
+.local-focus-overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; z-index: 3; }
+.local-focus-overlay ellipse { fill: #8dc9ff13; stroke: #d1edff; stroke-width: 1.5; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.local-focus-overlay line, .local-focus-overlay circle { fill: #b7e1ff; stroke: #b7e1ff; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.local-target { position: absolute; transform: translate(-50%, -50%); width: 44px; height: 44px; padding: 0; border: 0; background: transparent; z-index: 4; cursor: pointer; touch-action: none; }
+.local-target > span:first-child { position: absolute; width: 12px; height: 12px; top: 16px; left: 16px; background: #f6fbff; border: 2px solid #3871a7; border-radius: 50%; box-shadow: 0 1px 5px #0008; }
+.local-target.is-active { z-index: 5; }
+.local-target.is-active > span:first-child { background: #6cb9f4; border-color: white; box-shadow: 0 0 0 3px #2a71a58a, 0 1px 5px #0008; }
+.local-target-label { display: none; position: absolute; bottom: 39px; left: 50%; transform: translateX(-50%); line-height: 1.4; background: #edf5ffff; color: #274362; font-size: 10px; white-space: nowrap; padding: 3px 5px; border: 1px solid #3f5e80; border-radius: 4px; box-shadow: 0 2px 4px #0003; }
+.local-target:hover .local-target-label, .local-target:focus-visible .local-target-label, .local-target.is-active .local-target-label { display: block; }
+.local-instruction { pointer-events: none; }
+@media (max-width: 760px) { .niuniu-canvas .canvas-message { font-size: 10px; } .niuniu-canvas .local-instruction { max-width: calc(100% - 24px); } }

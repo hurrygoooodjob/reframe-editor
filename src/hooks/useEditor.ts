@@ -3,13 +3,22 @@ import { DEFAULT_SETTINGS, SHAPES } from '../types';
 import type { EditSettings, PixelImage, RenderResult, Tool, AutoSelectionInfo } from '../types';
 import { decodeImage, readDataURL, imageToCanvas, cleanFilename, encodeMask, decodeMask, defaultOutputSize, isImageDataURL, MAX_OUTPUT_PIXELS, MAX_PROJECT_BYTES } from '../io';
 import { startRender, startAutoAnalysis } from '../renderClient';
+import { parseLocalEdits, normalizeLocalEdit, MAX_LOCAL_EDITS } from '../localTypes';
+import type { LocalEdit } from '../localTypes';
+import { detectParts, cancelDetection } from '../vision/client';
+import { estimateCompressionCapacity } from '../engine/compressionCapacity';
 import { createRandomPlan } from '../autoPlan';
+import { emptyMaskOverrides, hasMaskOverrides, updateMaskOverrides, applyMaskOverrides, encodeMaskOverrides, decodeMaskOverrides } from '../maskOverrides';
 
 export interface SourceImage { image: PixelImage; url: string; name: string; }
-interface Snapshot { settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; }
-interface RestoredProject { settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; }
+interface Snapshot { settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; localEdits: LocalEdit[]; manualOverrides: Float32Array; }
+interface RestoredProject { settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; localEdits?: LocalEdit[]; manualOverrides: Float32Array; }
 const isCancelled = (error: unknown) => error instanceof Error && error.name === 'AbortError';
 export function useEditor() {
+  const [localEdits,setLocalEdits]=useState<LocalEdit[]>([]);
+  const localRef=useRef<LocalEdit[]>([]);
+  const manualOverrides=useRef<Float32Array>(emptyMaskOverrides(0));
+  const autoGeneration=useRef(0);
   const [source, setSource] = useState<SourceImage | null>(null);
   const [settings, setSettings] = useState<EditSettings>({...DEFAULT_SETTINGS, width:1280,height:850});
   const [mask, setMask] = useState<Float32Array>(() => new Float32Array(0));
@@ -22,7 +31,7 @@ export function useEditor() {
   const autoInfoRef=useRef<AutoSelectionInfo|null>(null);
   const autoTask=useRef<ReturnType<typeof startAutoAnalysis>|null>(null);
   const setAutoInfo=useCallback((value:AutoSelectionInfo|null)=>{autoInfoRef.current=value;setAutoInfoState(value);},[]);
-  const cancelAuto=useCallback(()=>{const task=autoTask.current;autoTask.current=null;task?.cancel();setAutoBusy(false);},[]);
+  const cancelAuto=useCallback(()=>{++autoGeneration.current;cancelDetection();const task=autoTask.current;autoTask.current=null;task?.cancel();setAutoBusy(false);},[]);
   const [busy,setBusy] = useState(false);
   const [previewProgress,setPreviewProgress] = useState({value:0,label:''});
   const [exportProgress,setExportProgress] = useState({value:0,label:''});
@@ -44,9 +53,9 @@ export function useEditor() {
   const record = useCallback((nextSettings:EditSettings, nextMask:Float32Array, replace=false) => {
     if (replace) {history.current=[];historyIndex.current=-1;}
     const current=history.current[historyIndex.current];
-    if(current && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current) return;
+    if(current && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current && current.localEdits===localRef.current && current.manualOverrides===manualOverrides.current) return;
     history.current=history.current.slice(0,historyIndex.current+1);
-    history.current.push({settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current});
+    history.current.push({settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current,localEdits:localRef.current,manualOverrides:manualOverrides.current});
     if(history.current.length>30) history.current.shift();
     historyIndex.current=history.current.length-1;syncHistory();
   },[]);
@@ -100,6 +109,8 @@ export function useEditor() {
     const nextSettings=restored?.settings||{...DEFAULT_SETTINGS,...defaultOutputSize(image.width,image.height)};
     cancelExport();cancelAuto();setExportImage(null);setProjectFile(null);
     setSource({image,url:persistentURL,name});setMaskSize(size);setMask(nextMask);setSettings(nextSettings);settingsRef.current=nextSettings;
+    localRef.current=restored?.localEdits||[];setLocalEdits(localRef.current);
+    manualOverrides.current=restored?.manualOverrides||emptyMaskOverrides(nextMask.length);
     setResult(null);setTool('transform');setAutoInfo(null);record(nextSettings,nextMask,true);
     notify(restored?'工程已恢复':nextSettings.width!==image.width||nextSettings.height!==image.height?'图片已打开，画布已适配输出尺寸上限':'图片已打开');
   },[record,notify,cancelExport,cancelAuto,setAutoInfo]);
@@ -136,30 +147,44 @@ export function useEditor() {
     if(nextMask.length!==maskSize.width*maskSize.height)return;
     const committed = new Float32Array(nextMask.length);
     for(let i=0;i<nextMask.length;i++) committed[i]=Number.isFinite(nextMask[i])?Math.max(-1,Math.min(1,nextMask[i])):0;
+    manualOverrides.current=updateMaskOverrides(mask,committed,manualOverrides.current);
     if(autoInfoRef.current)setAutoInfo({...autoInfoRef.current,edited:true});
     setMask(committed);record(settingsRef.current,committed);
-  },[record,maskSize,cancelAuto,setAutoInfo]);
-  const clearMask = useCallback(()=>{cancelAuto();setAutoInfo(null);const next=new Float32Array(mask.length);setMask(next);record(settingsRef.current,next);notify('选区已清空');},[mask.length,record,notify,cancelAuto,setAutoInfo]);
+  },[record,mask,maskSize,cancelAuto,setAutoInfo]);
+  const clearMask = useCallback(()=>{cancelAuto();setAutoInfo(null);const next=new Float32Array(mask.length);manualOverrides.current=emptyMaskOverrides(mask.length);setMask(next);record(settingsRef.current,next);notify('选区已清空');},[mask.length,record,notify,cancelAuto,setAutoInfo]);
   const undo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current<=0)return;
-    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);syncHistory();
+    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const redo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current>=history.current.length-1)return;
-    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);syncHistory();
+    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const reset = useCallback(()=>{
     cancelAuto();setAutoInfo(null);
     if(!source)return;
+    localRef.current=[];setLocalEdits([]);
+    manualOverrides.current=emptyMaskOverrides(mask.length);
     const next={...DEFAULT_SETTINGS,...defaultOutputSize(source.image.width,source.image.height)};
     const clean=new Float32Array(mask.length);settingsRef.current=next;setSettings(next);setMask(clean);setTool('transform');record(next,clean);notify('已恢复原始图片，可撤销');
   },[source,mask.length,record,notify,cancelAuto,setAutoInfo]);
 
+  const updateLocal=useCallback((edits:LocalEdit[],commit=true)=>{
+    cancelAuto();
+    if(edits.length>MAX_LOCAL_EDITS){notify(`最多保留 ${MAX_LOCAL_EDITS} 次局部操作，请撤销部分操作后继续。`);return;}
+    localRef.current=edits.map(edit=>normalizeLocalEdit(edit));setLocalEdits(localRef.current);
+    if(commit)record(settingsRef.current,mask);
+  },[cancelAuto,record,mask,notify]);
+  const addLocal=useCallback((edit:LocalEdit)=>updateLocal([...localRef.current,edit]),[updateLocal]);
+  const changeLocal=useCallback((id:string,patch:Partial<LocalEdit>,commit=false)=>updateLocal(localRef.current.map(edit=>edit.id===id?{...edit,...patch}:edit),commit),[updateLocal]);
+  const removeLocal=useCallback((id:string)=>updateLocal(localRef.current.filter(edit=>edit.id!==id)),[updateLocal]);
+
   const automatic = useCallback(async (randomize:boolean)=>{
     if(!source||exportTask.current)return;
     cancelAuto();
+    const generation=autoGeneration.current;
     setAutoBusy(true);setAutoProgress({value:0,label:'正在分析图片'});setError('');
     const seed=crypto.getRandomValues(new Uint32Array(1))[0];
     let task:ReturnType<typeof startAutoAnalysis>|null=null;
@@ -167,15 +192,32 @@ export function useEditor() {
       task=startAutoAnalysis({image:source.image,maskWidth:maskSize.width,maskHeight:maskSize.height,seed},(value,label)=>{if(autoTask.current===task)setAutoProgress({value,label});});
       autoTask.current=task;
       const selection=await task.promise;
-      if(autoTask.current!==task)return;
-      const nextSettings=randomize?createRandomPlan(source.image,settingsRef.current,seed):settingsRef.current;
-      const info:AutoSelectionInfo={seed,confidence:selection.confidence,regionCount:selection.regionCount,warnings:selection.warnings,edited:false};
+      if(autoTask.current!==task||generation!==autoGeneration.current)return;
+      try {
+        setAutoProgress({value:.5,label:'识别人物结构'});
+        const body=await detectParts(source.image,'body',label=>setAutoProgress({value:.6,label}));
+        if(autoTask.current!==task||generation!==autoGeneration.current)return;
+        if(body.protection){
+          const pm=body.protection;
+          for(let y=0;y<maskSize.height;y++)for(let x=0;x<maskSize.width;x++){
+            const v=pm.mask[Math.min(pm.height-1,Math.floor(y*pm.height/maskSize.height))*pm.width+Math.min(pm.width-1,Math.floor(x*pm.width/maskSize.width))];
+            if(v>.2)selection.mask[y*maskSize.width+x]=Math.max(selection.mask[y*maskSize.width+x],v);
+          }
+          selection.warnings=body.warnings;
+        }
+      } catch(e){if(generation!==autoGeneration.current)return;selection.warnings.push('人物识别暂不可用，已使用保守背景分析。');}
+      // Persist touched cells, including an intentional erasure to zero, across
+      // every automatic pass. Untouched automatic cells remain refreshable.
+      selection.mask=applyMaskOverrides(selection.mask,manualOverrides.current);
+      const capacity=estimateCompressionCapacity(selection.mask,maskSize.width,maskSize.height,selection.confidence);
+      const nextSettings=randomize?createRandomPlan(source.image,settingsRef.current,seed,capacity):settingsRef.current;
+      const info:AutoSelectionInfo={seed,confidence:selection.confidence,regionCount:selection.regionCount,warnings:selection.warnings,edited:hasMaskOverrides(manualOverrides.current)};
       setAutoInfo(info);setMask(selection.mask);settingsRef.current=nextSettings;setSettings(nextSettings);
       setTool(randomize?'transform':'protect');record(nextSettings,selection.mask);
-      notify(randomize?'新方案已生成，可撤销或继续涂抹修改':selection.protectRatio+selection.compressRatio===0?'暂未找到可靠选区，可继续手动涂抹':'自动选区已生成，绿色保护、橙色优先压缩');
+      notify(randomize?(nextSettings.width===settingsRef.current.width&&capacity.width===0&&capacity.height===0?'可压缩空间较少，已保留当前尺寸':'新方案已生成，可继续调整或撤销'):selection.protectRatio+selection.compressRatio===0?'暂未找到可靠选区，可继续手动涂抹':'自动选区已生成，绿色保护、橙色优先压缩');
     }catch(e){if((!task||autoTask.current===task)&&!isCancelled(e))setError(e instanceof Error?e.message:'自动选区未完成。');}
     finally{if(autoTask.current===task){autoTask.current=null;setAutoBusy(false);}}
-  },[source,maskSize,cancelAuto,record,notify,setAutoInfo]);
+  },[source,mask,maskSize,cancelAuto,record,notify,setAutoInfo]);
 
   useEffect(()=>{
     if(!source)return;
@@ -183,12 +225,12 @@ export function useEditor() {
     setBusy(true);setPreviewProgress({value:0,label:'准备预览'});setError('');
     const timer=setTimeout(()=>{
       try {
-        task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,maxOutputEdge:900},(value,label)=>{if(!disposed)setPreviewProgress({value,label});});
+        task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits,maxOutputEdge:900},(value,label)=>{if(!disposed)setPreviewProgress({value,label});});
         task.promise.then(data=>{if(!disposed){setResult(data);setBusy(false);}}).catch(e=>{if(!disposed){if(!isCancelled(e))setError(e instanceof Error?e.message:'预览失败');setBusy(false);}});
       } catch(e) { if(!disposed){setError(e instanceof Error?e.message:'预览无法启动');setBusy(false);} }
     },100);
     return()=>{disposed=true;clearTimeout(timer);task?.cancel();};
-  },[source,mask,maskSize,settings,revision]);
+  },[source,mask,maskSize,settings,localEdits,revision]);
 
   const exportPNG = useCallback(async()=>{
     if(!source||exportTask.current||autoTask.current)return;
@@ -196,7 +238,7 @@ export function useEditor() {
     setExporting(true);setError('');setExportImage(null);setExportProgress({value:0,label:'准备高清导出'});
     let task: ReturnType<typeof startRender> | null = null;
     try{
-      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings},(value,label)=>{
+      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits},(value,label)=>{
         if(exportTask.current===task)setExportProgress({value,label});
       });
       exportTask.current=task;
@@ -204,22 +246,22 @@ export function useEditor() {
       if(exportTask.current!==task)return;
       const url=imageToCanvas(output.image).toDataURL('image/png');
       if(!isImageDataURL(url))throw new Error('浏览器无法创建该尺寸的 PNG，请调小宽度或高度。');
-      setExportImage({url,name:`${cleanFilename(source.name)}-折形-${settings.width}x${settings.height}.png`,width:output.image.width,height:output.image.height,warnings:output.warnings});
+      setExportImage({url,name:`${cleanFilename(source.name)}-Niuniu-${settings.width}x${settings.height}.png`,width:output.image.width,height:output.image.height,warnings:output.warnings});
     }catch(e){if((!task||exportTask.current===task)&&!isCancelled(e))setError(e instanceof Error?e.message:'导出失败');}
     finally{if(exportTask.current===task){setExporting(false);exportTask.current=null;}}
-  },[source,settings,mask,maskSize]);
+  },[source,settings,mask,maskSize,localEdits]);
 
   const saveProject = useCallback(()=>{
     if(!source)return;
     try {
       if(settings.width*settings.height>MAX_OUTPUT_PIXELS)throw new Error('工程输出超过 2400 万像素，请调小宽度或高度后保存。');
-      const json=JSON.stringify({format:'reframe-project',version:1,name:source.name,image:source.url,settings,mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
+      const json=JSON.stringify({format:'niuniu-project',version:2,name:source.name,image:source.url,settings,localEdits,manualOverrides:encodeMaskOverrides(manualOverrides.current),mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
       const file=new Blob([json],{type:'application/json'});
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件超过 75 MB，请使用较小的图片。');
       const url=URL.createObjectURL(file);
-      setProjectFile({url,name:`${cleanFilename(source.name)}.reframe.json`});
+      setProjectFile({url,name:`${cleanFilename(source.name)}.niuniu.json`});
     } catch(e) { setError(e instanceof Error?e.message:'工程无法保存。'); }
-  },[source,settings,mask,maskSize]);
+  },[source,settings,mask,maskSize,localEdits]);
   useEffect(()=>()=>{if(projectFile)URL.revokeObjectURL(projectFile.url);},[projectFile]);
 
   const loadProject = useCallback(async(file:File)=>{
@@ -228,7 +270,7 @@ export function useEditor() {
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件过大，请使用 75 MB 以内的工程。');
       const data=JSON.parse(await file.text());
       if(token!==importToken.current)return;
-      if(!data||data.format!=='reframe-project'||data.version!==1||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的折形工程文件。');
+      if(!data||!((data.format==='reframe-project'&&data.version===1)||(data.format==='niuniu-project'&&data.version===2))||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的 Niuniu 工程文件。');
       const s=data.settings;
       if(!s||!Number.isInteger(s.width)||!Number.isInteger(s.height)||s.width<32||s.height<32||s.width>8192||s.height>8192||s.width*s.height>MAX_OUTPUT_PIXELS||!SHAPES.some(shape=>shape.id===s.shape)||!['draft','balanced','fine'].includes(s.quality))throw new Error('工程参数不完整或输出尺寸超限。');
       for(const key of ['contentAmount','squeeze','protectStrength'])if(!Number.isFinite(s[key])||s[key]<0||s[key]>1)throw new Error('工程参数超出范围。');
@@ -239,11 +281,13 @@ export function useEditor() {
       const m=data.mask;
       if(!m||!Number.isInteger(m.width)||!Number.isInteger(m.height)||m.width<1||m.height<1||m.width>1024||m.height>1024||typeof m.data!=='string')throw new Error('工程选区尺寸无效。');
       const restoredSettings: EditSettings={width:s.width,height:s.height,shape:s.shape,quality:s.quality,contentAmount:s.contentAmount,transitionSoftness,squeeze:s.squeeze,protectStrength:s.protectStrength,forwardEnergy:s.forwardEnergy};
-      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{settings:restoredSettings,mask:decodeMask(m.data,m.width*m.height),maskSize:{width:m.width,height:m.height}});
+      const restoredMask=decodeMask(m.data,m.width*m.height);
+      const restoredOverrides=decodeMaskOverrides(data.version===2?data.manualOverrides:undefined,restoredMask);
+      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{settings:restoredSettings,mask:restoredMask,maskSize:{width:m.width,height:m.height},localEdits:data.version===2?parseLocalEdits(data.localEdits):[],manualOverrides:restoredOverrides});
     }catch(e){if(token===importToken.current)setError(e instanceof Error?e.message:'工程无法读取。');}
   },[beginImport,applyImage]);
 
-  return {source,settings,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
+  return {source,settings,localEdits,updateLocal,addLocal,changeLocal,removeLocal,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
     loadImage,importImage,changeSettings,commitMask,clearMask,undo,redo,historyState,reset,
     autoBusy,autoProgress,autoInfo,cancelAuto,autoAnalyze:()=>automatic(false),randomSqueeze:()=>automatic(true),
     exporting,exportPNG,cancelExport,exportImage,setExportImage,
