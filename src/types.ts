@@ -1,3 +1,4 @@
+import type { EffectLayer } from './effects/layers';
 import type { EffectSettings } from './effects/catalog';
 import type { LocalEdit } from './localTypes';
 // The shape is stored in logical coordinates. Exported pixels have a separate budget.
@@ -25,6 +26,7 @@ export interface RenderRequest {
   settings: EditSettings;
   maxOutputEdge?: number;
   outputSize?: {width:number;height:number};
+  layers?: EffectLayer[];
   effect?: EffectSettings | null;
   localEdits?: LocalEdit[];
 }

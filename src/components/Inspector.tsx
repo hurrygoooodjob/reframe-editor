@@ -188,7 +188,7 @@ export default function Inspector(props: InspectorProps) {
       <p className="field-note">精细模式保留更多结构，计算时间会增加。导出时可单独指定成片尺寸。</p>
       <div className="section-heading"><h2>继续编辑</h2></div>
       <div className="project-actions"><button className="btn" onClick={onSaveProject} disabled={busy}><Icon name="save" size={16}/>保存工程</button><button className="btn" onClick={onLoadProject}><Icon name="open" size={16}/>打开工程</button></div>
-      <p className="field-note">工程包含工作图片、效果、参数和选区。关闭页面前保存，下次打开即可继续。</p>
+      <p className="field-note">工程包含工作图片、塑形、选区、效果层和每层的擦除痕迹。关闭页面前保存，下次打开即可继续。</p>
       <button className="reset-button" onClick={onReset}><Icon name="reset" size={16}/><span>还原所有编辑</span></button>
     </section>}
     <div className="inspector-footer"><Icon name="shield" size={14}/><span>图片仅在你的设备中处理</span></div>

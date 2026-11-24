@@ -1,3 +1,4 @@
+import type { EffectLayer } from './effects/layers';
 import type { EffectSettings } from './effects/catalog';
 import type { PixelImage } from './types';
 import workerSource from './generated-worker';
@@ -9,8 +10,14 @@ export interface EffectRequest {
   reference: { width: number; height: number };
 }
 
+export interface EffectLayersRequest {
+  image: PixelImage;
+  layers: EffectLayer[];
+  reference: { width: number; height: number };
+}
+
 let sequence = 0;
-function startTask<T>(kind:'render'|'analyze'|'effect',request:RenderRequest|AutoRegionsRequest|EffectRequest,progress:(value:number,label:string)=>void){
+function startTask<T>(kind:'render'|'analyze'|'effect'|'layers',request:RenderRequest|AutoRegionsRequest|EffectRequest|EffectLayersRequest,progress:(value:number,label:string)=>void){
   const id=++sequence;
   const url=URL.createObjectURL(new Blob([workerSource],{type:'text/javascript'}));
   let worker:Worker;
@@ -36,4 +43,8 @@ export const startAutoAnalysis=(request:AutoRegionsRequest,progress:(value:numbe
 
 export function startEffect(request: EffectRequest) {
   return startTask<PixelImage>('effect', request, () => {});
+}
+
+export function startEffects(request: EffectLayersRequest, progress: (value:number, label:string)=>void = () => {}) {
+  return startTask<PixelImage>('layers', request, progress);
 }

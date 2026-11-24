@@ -3,8 +3,13 @@ import { DEFAULT_SETTINGS, MAX_CANVAS_EDGE, SHAPES } from '../types';
 import type { EditSettings, PixelImage, RenderResult, Tool, AutoSelectionInfo } from '../types';
 import { loadImageSource, imageToPNGBlob, cleanFilename, encodeMask, decodeMask, defaultOutputSize, isImageDataURL, MAX_PROJECT_BYTES } from '../io';
 import { normalizeEffect, type EffectSettings } from '../effects/catalog';
+import {
+  createEffectLayer, decodeEffectLayers, encodeEffectLayers, migrateSingleEffect,
+  MAX_EFFECT_LAYERS, type EffectLayer, type EffectLayerMask,
+} from '../effects/layers';
+import { useStackPreview } from './useStackPreview';
 import { validateExportSize, type PixelSize } from '../exportSize';
-import { startEffect, startRender, startAutoAnalysis } from '../renderClient';
+import { startRender, startAutoAnalysis } from '../renderClient';
 import { parseLocalEdits, normalizeLocalEdit, MAX_LOCAL_EDITS } from '../localTypes';
 import type { LocalEdit } from '../localTypes';
 import { detectParts, cancelDetection } from '../vision/client';
@@ -13,14 +18,13 @@ import { createRandomPlan } from '../autoPlan';
 import { emptyMaskOverrides, hasMaskOverrides, updateMaskOverrides, applyMaskOverrides, encodeMaskOverrides, decodeMaskOverrides } from '../maskOverrides';
 
 export interface SourceImage { image: PixelImage; url: string; name: string; }
-interface Snapshot { effect: EffectSettings | null; settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; localEdits: LocalEdit[]; manualOverrides: Float32Array; }
-interface RestoredProject { legacyProject:boolean; effect: EffectSettings | null; settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; localEdits?: LocalEdit[]; manualOverrides: Float32Array; }
+interface Snapshot { layers: EffectLayer[]; settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; localEdits: LocalEdit[]; manualOverrides: Float32Array; }
+interface RestoredProject { legacyProject:boolean; layers: EffectLayer[]; settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; localEdits?: LocalEdit[]; manualOverrides: Float32Array; }
 const isCancelled = (error: unknown) => error instanceof Error && error.name === 'AbortError';
 export function useEditor() {
-  const [effect, setEffect] = useState<EffectSettings | null>(null);
-  const effectRef = useRef<EffectSettings | null>(null);
-  const [effectPreview, setEffectPreview] = useState<RenderResult | null>(null);
-  const [effectBusy, setEffectBusy] = useState(false);
+  const [layers, setLayers] = useState<EffectLayer[]>([]);
+  const layersRef = useRef(layers);
+  const [draft, setDraft] = useState<{base:EffectLayer[]; layers:EffectLayer[]} | null>(null);
   const [localEdits,setLocalEdits]=useState<LocalEdit[]>([]);
   const localRef=useRef<LocalEdit[]>([]);
   const manualOverrides=useRef<Float32Array>(emptyMaskOverrides(0));
@@ -59,9 +63,9 @@ export function useEditor() {
   const record = useCallback((nextSettings:EditSettings, nextMask:Float32Array, replace=false) => {
     if (replace) {history.current=[];historyIndex.current=-1;}
     const current=history.current[historyIndex.current];
-    if(current && JSON.stringify(current.effect)===JSON.stringify(effectRef.current) && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current && current.localEdits===localRef.current && current.manualOverrides===manualOverrides.current) return;
+    if(current && current.layers===layersRef.current && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current && current.localEdits===localRef.current && current.manualOverrides===manualOverrides.current) return;
     history.current=history.current.slice(0,historyIndex.current+1);
-    history.current.push({effect:effectRef.current,settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current,localEdits:localRef.current,manualOverrides:manualOverrides.current});
+    history.current.push({layers:layersRef.current,settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current,localEdits:localRef.current,manualOverrides:manualOverrides.current});
     if(history.current.length>30) history.current.shift();
     historyIndex.current=history.current.length-1;syncHistory();
   },[]);
@@ -112,9 +116,9 @@ export function useEditor() {
     const nextMask=restored?.mask||new Float32Array(size.width*size.height);
     const nextSettings=restored?.settings||{...DEFAULT_SETTINGS,...defaultOutputSize(image.width,image.height)};
     cancelExport();cancelAuto();setExportImage(null);setProjectFile(null);
-    effectRef.current = restored?.effect ?? null;
-    setEffect(effectRef.current);
-    setEffectPreview(null);
+    layersRef.current = restored?.layers ?? [];
+    setLayers(layersRef.current);
+    setDraft(null);
     setSource({image,url:persistentURL,name});setMaskSize(size);setMask(nextMask);setSettings(nextSettings);settingsRef.current=nextSettings;
     localRef.current=restored?.localEdits||[];setLocalEdits(localRef.current);
     manualOverrides.current=restored?.manualOverrides||emptyMaskOverrides(nextMask.length);
@@ -160,17 +164,17 @@ export function useEditor() {
   const undo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current<=0)return;
-    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);effectRef.current=snap.effect;setEffect(snap.effect);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
+    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);layersRef.current=snap.layers;setLayers(snap.layers);setDraft(null);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const redo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current>=history.current.length-1)return;
-    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);effectRef.current=snap.effect;setEffect(snap.effect);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
+    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);layersRef.current=snap.layers;setLayers(snap.layers);setDraft(null);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const reset = useCallback(()=>{
     cancelAuto();setAutoInfo(null);
     if(!source)return;
-    effectRef.current=null;setEffect(null);
+    layersRef.current=[];setLayers(layersRef.current);setDraft(null);
     localRef.current=[];setLocalEdits([]);
     manualOverrides.current=emptyMaskOverrides(mask.length);
     const next={...DEFAULT_SETTINGS,...defaultOutputSize(source.image.width,source.image.height)};
@@ -238,42 +242,60 @@ export function useEditor() {
     return()=>{disposed=true;clearTimeout(timer);task?.cancel();};
   },[source,mask,maskSize,settings,localEdits,revision]);
 
-  const changeEffect = useCallback((value: EffectSettings | null, commit = true) => {
-    const next = normalizeEffect(value);
-    if (JSON.stringify(next) !== JSON.stringify(effectRef.current)) {
-      effectRef.current = next;
-      setEffect(next);
-    }
+  function updateLayers(next: EffectLayer[], commit = true) {
+    setDraft(null);
+    layersRef.current = next;
+    setLayers(next);
     if (commit) record(settingsRef.current, mask);
-  }, [mask, record]);
-
-  // Changing a filter reuses the last warped preview. Detection always sees the unfiltered image.
-  useEffect(() => {
-    if (!result || !effect) {
-      setEffectPreview(null);
-      setEffectBusy(false);
-      return;
+  }
+  function addLayer(effect: EffectSettings): string | null {
+    const current = layersRef.current;
+    if (current.length >= MAX_EFFECT_LAYERS) {
+      notify(`最多可叠加 ${MAX_EFFECT_LAYERS} 个效果层。`);
+      return null;
     }
-    let active = true;
-    let task: ReturnType<typeof startEffect> | undefined;
-    setEffectBusy(true);
-    const timer = setTimeout(async () => {
-      try {
-        task = startEffect({image: result.image, effect, reference: {width:settings.width, height:settings.height}});
-        const image = await task.promise;
-        if (active) setEffectPreview({...result, image});
-      } catch (cause) {
-        if (active && !isCancelled(cause)) {
-          setEffectPreview(null);
-          setError(cause instanceof Error ? cause.message : '效果预览失败，请重试。');
-        }
-      } finally {
-        if (active) setEffectBusy(false);
-      }
-    }, 45);
-    return () => { active = false; clearTimeout(timer); task?.cancel(); };
-  }, [result, effect, settings.width, settings.height]);
-  const displayedResult = effect ? effectPreview ?? result : result;
+    const layer = createEffectLayer(effect);
+    updateLayers([...current, layer]);
+    return layer.id;
+  }
+  function changeLayer(id: string, settings: EffectSettings, commit: boolean) {
+    const current = layersRef.current;
+    const layer = current.find(item => item.id === id);
+    const effect = normalizeEffect(settings);
+    if (!effect || !layer) return;
+    if (JSON.stringify(layer.effect) !== JSON.stringify(effect)) {
+      updateLayers(current.map(item => item.id === id ? {...item, effect} : item), commit);
+    } else if (commit) record(settingsRef.current, mask);
+  }
+  function moveLayer(id: string, offset: -1 | 1) {
+    const next = [...layersRef.current];
+    const from = next.findIndex(layer => layer.id === id), to = from + offset;
+    if (from < 0 || to < 0 || to >= next.length) return;
+    [next[from], next[to]] = [next[to], next[from]];
+    updateLayers(next);
+  }
+  function removeLayer(id: string) {
+    const current = layersRef.current;
+    if (current.some(layer => layer.id === id)) updateLayers(current.filter(layer => layer.id !== id));
+  }
+  function previewLayerMask(id: string, mask: EffectLayerMask | null) {
+    const base = layersRef.current;
+    if (!mask) { setDraft(null); return; }
+    if (base.some(layer => layer.id === id)) {
+      setDraft({base, layers: base.map(layer => layer.id === id ? {...layer, mask} : layer)});
+    }
+  }
+  function commitLayerMask(id: string, mask: EffectLayerMask) {
+    const current = layersRef.current;
+    if (current.some(layer => layer.id === id)) {
+      updateLayers(current.map(layer => layer.id === id ? {...layer, mask} : layer));
+    } else setDraft(null);
+  }
+
+  const pendingLayers = draft?.base === layers ? draft.layers : layers;
+  const preview = useStackPreview(result, pendingLayers, settings.width, settings.height, setError);
+  const displayedResult = preview.result;
+  const effectBusy = preview.busy;
 
   const exportPNG = useCallback(async(size: PixelSize)=>{
     if(!source||exportTask.current||autoTask.current)return;
@@ -282,7 +304,7 @@ export function useEditor() {
     setExporting(true);setError('');setExportImage(null);setExportProgress({value:0,label:'准备高清导出'});
     let task: ReturnType<typeof startRender> | null = null;
     try{
-      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits,outputSize:size,effect},(value,label)=>{
+      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits,outputSize:size,layers},(value,label)=>{
         if(exportTask.current===task)setExportProgress({value,label});
       });
       exportTask.current=task;
@@ -296,7 +318,7 @@ export function useEditor() {
       setExportImage({url, name:`${cleanFilename(source.name)}-Niuniu-${width}x${height}.png`, width, height, warnings:output.warnings});
     }catch(e){if((!task||exportTask.current===task)&&!isCancelled(e))setError(e instanceof Error?e.message:'导出失败');}
     finally{if(exportTask.current===task){setExporting(false);exportTask.current=null;}}
-  },[source,settings,mask,maskSize,localEdits,effect]);
+  },[source,settings,mask,maskSize,localEdits,layers]);
 
   useEffect(() => () => {
     if (exportImage) URL.revokeObjectURL(exportImage.url);
@@ -305,13 +327,13 @@ export function useEditor() {
   const saveProject = useCallback(()=>{
     if(!source)return;
     try {
-      const json=JSON.stringify({format:'niuniu-project',version:3,effect,name:source.name,image:source.url,settings,localEdits,manualOverrides:encodeMaskOverrides(manualOverrides.current),mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
+      const json=JSON.stringify({format:'niuniu-project',version:4,layers:encodeEffectLayers(layers),name:source.name,image:source.url,settings,localEdits,manualOverrides:encodeMaskOverrides(manualOverrides.current),mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
       const file=new Blob([json],{type:'application/json'});
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件超过 75 MB，请使用较小的图片。');
       const url=URL.createObjectURL(file);
       setProjectFile({url,name:`${cleanFilename(source.name)}.niuniu.json`});
     } catch(e) { setError(e instanceof Error?e.message:'工程无法保存。'); }
-  },[source,settings,mask,maskSize,localEdits,effect]);
+  },[source,settings,mask,maskSize,localEdits,layers]);
   useEffect(()=>()=>{if(projectFile)URL.revokeObjectURL(projectFile.url);},[projectFile]);
 
   const loadProject = useCallback(async(file:File)=>{
@@ -320,7 +342,7 @@ export function useEditor() {
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件过大，请使用 75 MB 以内的工程。');
       const data=JSON.parse(await file.text());
       if(token!==importToken.current)return;
-      if(!data||!((data.format==='reframe-project'&&data.version===1)||(data.format==='niuniu-project'&&[2,3].includes(data.version)))||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的 Niuniu 工程文件。');
+      if(!data||!((data.format==='reframe-project'&&data.version===1)||(data.format==='niuniu-project'&&[2,3,4].includes(data.version)))||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的 Niuniu 工程文件。');
       const s=data.settings;
       if(!s||!Number.isInteger(s.width)||!Number.isInteger(s.height)||s.width<32||s.height<32||s.width>MAX_CANVAS_EDGE||s.height>MAX_CANVAS_EDGE||!SHAPES.some(shape=>shape.id===s.shape)||!['draft','balanced','fine'].includes(s.quality))throw new Error('工程参数不完整或输出尺寸超限。');
       for(const key of ['contentAmount','squeeze','protectStrength'])if(!Number.isFinite(s[key])||s[key]<0||s[key]>1)throw new Error('工程参数超出范围。');
@@ -333,11 +355,11 @@ export function useEditor() {
       const restoredSettings: EditSettings={width:s.width,height:s.height,shape:s.shape,quality:s.quality,contentAmount:s.contentAmount,transitionSoftness,squeeze:s.squeeze,protectStrength:s.protectStrength,forwardEnergy:s.forwardEnergy};
       const restoredMask=decodeMask(m.data,m.width*m.height);
       const restoredOverrides=decodeMaskOverrides(data.version>=2?data.manualOverrides:undefined,restoredMask);
-      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{legacyProject:true,effect:data.version===3?normalizeEffect(data.effect):null,settings:restoredSettings,mask:restoredMask,maskSize:{width:m.width,height:m.height},localEdits:data.version>=2?parseLocalEdits(data.localEdits):[],manualOverrides:restoredOverrides});
+      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{legacyProject:true,layers:data.version===4?decodeEffectLayers(data.layers):data.version===3?migrateSingleEffect(data.effect):[],settings:restoredSettings,mask:restoredMask,maskSize:{width:m.width,height:m.height},localEdits:data.version>=2?parseLocalEdits(data.localEdits):[],manualOverrides:restoredOverrides});
     }catch(e){if(token===importToken.current)setError(e instanceof Error?e.message:'工程无法读取。');}
   },[beginImport,applyImage]);
 
-  return {source,settings,effect,changeEffect,displayedResult,effectBusy,localEdits,updateLocal,addLocal,changeLocal,removeLocal,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
+  return {source,settings,layers,addLayer,changeLayer,moveLayer,removeLayer,previewLayerMask,commitLayerMask,displayedResult,effectBusy,localEdits,updateLocal,addLocal,changeLocal,removeLocal,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
     loadImage,importImage,changeSettings,commitMask,clearMask,undo,redo,historyState,reset,
     autoBusy,autoProgress,autoInfo,cancelAuto,autoAnalyze:()=>automatic(false),randomSqueeze:()=>automatic(true),
     exporting,exportPNG,cancelExport,exportImage,setExportImage,

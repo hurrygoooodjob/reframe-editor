@@ -5,10 +5,24 @@ import type { SourceImage } from '../hooks/useEditor';
 import Icon from './Icon';
 import { RESIZE_HANDLES, resizeGeometry, stampSoftBrush } from './canvasGeometry';
 import type { Point, ResizeHandle } from './canvasGeometry';
+import { beginLayerBrush, stampLayerBrush } from '../effects/layers';
+import type { EffectLayerMask } from '../effects/layers';
 import './canvas-improvements.css';
 
 export interface LocalCanvasTarget { id: string; label: string; cx: number; cy: number; rx: number; ry: number; angle: number }
+export interface CanvasLayerBrush {
+  layerId: string;
+  mask?: EffectLayerMask;
+  mode: 'erase' | 'restore';
+  size: number;
+  hardness: number;
+}
+
 interface Props {
+  layerBrush?: CanvasLayerBrush | null;
+  onLayerBrushPreview?: (layerId: string, mask: EffectLayerMask | null) => void;
+  onLayerBrushCommit?: (layerId: string, mask: EffectLayerMask) => void;
+  onLayerBrushDone?: () => void;
   effectMode?: boolean;
   source: SourceImage; settings: EditSettings; result: RenderResult | null; tool: Tool;
   mask: Float32Array; maskSize: { width: number; height: number }; brushSize: number; brushHardness?: number; showMask: boolean;
@@ -26,6 +40,7 @@ type Context = { pointerId: number; source: SourceImage; mask: Float32Array; too
 type Gesture = Context & (
   { kind: 'paint'; data: Float32Array; base: Float32Array; coverage: Float32Array; start: Point; last: Point }
   | { kind: 'resize'; start: Point; width: number; height: number; scale: number; handle: ResizeHandle; locked: boolean; origin: Point; last: { width: number; height: number }; shift: Point }
+  | { kind: 'layer'; brush: CanvasLayerBrush; stroke: ReturnType<typeof beginLayerBrush>; last: Point; radius: Point; due: number; timer?: number }
   | { kind: 'pan'; start: Point; origin: Point }
   | { kind: 'local'; start: Point; last: Point; radius: Point; mode: 'scale' | 'push' }
 );
@@ -38,6 +53,7 @@ export default function CanvasEditor(p: Props) {
   const stage = useRef<HTMLDivElement>(null), wrap = useRef<HTMLDivElement>(null);
   const pixels = useRef<HTMLCanvasElement>(null), overlay = useRef<HTMLCanvasElement>(null);
   const gesture = useRef<Gesture | null>(null), pinch = useRef<Pinch | null>(null);
+  const brushCursor = useRef<HTMLDivElement>(null);
   const pointers = useRef(new Map<number, Point>()), holdingSpace = useRef(false);
   const resizeRestore = useRef<{ width: number; height: number; center: Point; scale: number } | null>(null);
   const latest = useRef(p); latest.current = p;
@@ -46,8 +62,9 @@ export default function CanvasEditor(p: Props) {
   const rawViewRef = useRef(view); rawViewRef.current = view;
   const [resizeOffset, setResizeOffset] = useState<Point>({ x: 0, y: 0 });
   const [pushPreview, setPushPreview] = useState<{ from: Point; to: Point; radius: Point } | null>(null);
-  const painting = isPainting(p.tool) && !p.compare;
-  const local = p.tool === 'local' && !p.compare;
+  const painting = isPainting(p.tool) && !p.compare && !p.effectMode;
+  const local = p.tool === 'local' && !p.compare && !p.effectMode;
+  const layerBrush = p.effectMode && !p.compare ? p.layerBrush : null;
   const original = painting || p.compare;
   const width = original ? p.source.image.width : p.settings.width;
   const height = original ? p.source.image.height : p.settings.height;
@@ -81,6 +98,11 @@ export default function CanvasEditor(p: Props) {
     const g = gesture.current; gesture.current = null; setResizeOffset({ x: 0, y: 0 }); setPushPreview(null);
     if (!g) return;
     if (releaseCapture) release(g.pointerId);
+    if (g.kind === 'layer') {
+      window.clearTimeout(g.timer);
+      latest.current.onLayerBrushPreview?.(g.brush.layerId, null);
+      hideBrushCursor();
+    }
     if (g.kind === 'paint') paintOverlay(latest.current.mask);
     if (g.kind === 'resize' && restoreResize && latest.current.source === g.source && latest.current.mask === g.mask)
       latest.current.onChange({ width: g.width, height: g.height }, false);
@@ -101,7 +123,7 @@ export default function CanvasEditor(p: Props) {
       // to keep it visible; restore the old framing when that inspector closes.
       if (oldAnchor) {
         const v = { scale: viewRef.current.scale, pan: rawViewRef.current.pan };
-        const props = latest.current, showOriginal = isPainting(props.tool) || props.compare;
+        const props = latest.current, showOriginal = (isPainting(props.tool) && !props.effectMode) || props.compare;
         const iw = (showOriginal ? props.source.image.width : props.settings.width) * v.scale;
         const ih = (showOriginal ? props.source.image.height : props.settings.height) * v.scale;
         const priorCenter = { x: oldAnchor.x + v.pan.x, y: oldAnchor.y + v.pan.y };
@@ -119,7 +141,7 @@ export default function CanvasEditor(p: Props) {
         setView({ scale: v.scale, pan: { x: center.x - nextAnchor.x, y: center.y - nextAnchor.y } });
       }
       else {
-        const props = latest.current, showOriginal = isPainting(props.tool) || props.compare;
+        const props = latest.current, showOriginal = (isPainting(props.tool) && !props.effectMode) || props.compare;
         const iw = showOriginal ? props.source.image.width : props.settings.width, ih = showOriginal ? props.source.image.height : props.settings.height;
         const small = rect.width <= 760 || rect.height <= 380;
         const initialScale = Math.max(.001, Math.min(Math.max(1, rect.width - (small ? 64 : 130)) / iw, Math.max(1, rect.height - (small ? 86 : 120)) / ih, 1));
@@ -135,8 +157,14 @@ export default function CanvasEditor(p: Props) {
     const size = g.kind === 'resize' ? g.last : g.settings;
     const changed = p.settings.width !== size.width || p.settings.height !== size.height
       || (['contentAmount', 'transitionSoftness', 'shape', 'squeeze', 'protectStrength', 'forwardEnergy', 'quality'] as const).some(key => p.settings[key] !== g.settings[key]);
+    if (g.kind === 'layer' && (!layerBrush || g.brush.layerId !== layerBrush.layerId ||
+      g.brush.mask !== layerBrush.mask || g.brush.mode !== layerBrush.mode ||
+      g.brush.size !== layerBrush.size || g.brush.hardness !== layerBrush.hardness)) {
+      cancelAll(false);
+      return;
+    }
     if (p.source !== g.source || p.mask !== g.mask || p.tool !== g.tool || p.compare !== g.compare || changed) cancelAll(false);
-  }, [p.source, p.mask, p.tool, p.compare, p.settings]);
+  }, [p.source, p.mask, p.tool, p.compare, p.settings, layerBrush?.layerId, layerBrush?.mask, layerBrush?.mode, layerBrush?.size, layerBrush?.hardness]);
   useLayoutEffect(() => { if (p.geometryLocked) cancelAll(false); }, [p.geometryLocked]);
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -149,7 +177,13 @@ export default function CanvasEditor(p: Props) {
     const visibility = () => { if (document.hidden) blur(); };
     document.addEventListener('keydown', down, true); document.addEventListener('keyup', up);
     window.addEventListener('blur', blur); document.addEventListener('visibilitychange', visibility);
-    return () => { document.removeEventListener('keydown', down, true); document.removeEventListener('keyup', up); window.removeEventListener('blur', blur); document.removeEventListener('visibilitychange', visibility); };
+    return () => {
+      document.removeEventListener('keydown', down, true); document.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur); document.removeEventListener('visibilitychange', visibility);
+      const g = gesture.current;
+      if (g?.kind === 'layer') window.clearTimeout(g.timer);
+      gesture.current = null;
+    };
   }, []);
   useLayoutEffect(() => {
     const canvas = pixels.current; if (!canvas) return;
@@ -199,7 +233,61 @@ export default function CanvasEditor(p: Props) {
     }
     g.last = point; paintOverlay(g.data);
   }
+  function hideBrushCursor() {
+    if (brushCursor.current) brushCursor.current.hidden = true;
+  }
+
+  function placeBrushCursor(e: ReactPointerEvent<HTMLDivElement>) {
+    const ring = brushCursor.current;
+    if (!layerBrush || !ring || !stage.current || !wrap.current) return;
+    const bounds = wrap.current.getBoundingClientRect();
+    if (e.altKey || holdingSpace.current || pinch.current || e.clientX < bounds.left ||
+      e.clientX > bounds.right || e.clientY < bounds.top || e.clientY > bounds.bottom) {
+      hideBrushCursor();
+      return;
+    }
+    const origin = stage.current.getBoundingClientRect();
+    ring.hidden = false;
+    ring.style.left = (e.clientX - origin.left) + 'px';
+    ring.style.top = (e.clientY - origin.top) + 'px';
+  }
+
+  function layerPoint(e: {clientX: number; clientY: number}, rect: DOMRect): Point {
+    return { x: (e.clientX - rect.left) / rect.width, y: (e.clientY - rect.top) / rect.height };
+  }
+
+  function previewStroke(g: Extract<Gesture, {kind: 'layer'}>) {
+    if (g.timer !== undefined) return;
+    // Submit a bounded number of immutable snapshots. Completed samples are
+    // redrawn using the same ordered compositor as the final export.
+    const emit = () => {
+      g.timer = undefined;
+      if (gesture.current !== g) return;
+      g.due = performance.now() + 110;
+      const mask = g.stroke.mask;
+      latest.current.onLayerBrushPreview?.(g.brush.layerId, {...mask, data: mask.data.slice()});
+    };
+    if (performance.now() >= g.due) emit();
+    else g.timer = window.setTimeout(emit, g.due - performance.now());
+  }
+
+  function drawLayerSegment(g: Extract<Gesture, {kind: 'layer'}>, point: Point) {
+    const dx = point.x - g.last.x, dy = point.y - g.last.y;
+    // Normalized radii represent a circular screen brush even after zooming
+    // or changing the aspect ratio of the editor's output.
+    const count = Math.max(1, Math.ceil(Math.hypot(dx / g.radius.x, dy / g.radius.y) * 4));
+    for (let sample = 1; sample <= count; sample++) {
+      stampLayerBrush(g.stroke, {
+        x: g.last.x + dx * sample / count,
+        y: g.last.y + dy * sample / count,
+      }, g.radius, g.brush.hardness, g.brush.mode);
+    }
+    g.last = point;
+    previewStroke(g);
+  }
+
   function beginPinch() {
+    hideBrushCursor();
     const [a, b] = [...pointers.current.values()]; if (!a || !b) return;
     const resizeGesture = gesture.current?.kind === 'resize' ? gesture.current : null;
     const v = resizeGesture ? { scale: resizeGesture.scale, pan: resizeGesture.origin } : viewRef.current;
@@ -218,8 +306,21 @@ export default function CanvasEditor(p: Props) {
     if ((e.target as HTMLElement).closest('button')) return;
     const within = wrap.current?.contains(e.target as Node);
     setView(v => ({ ...v, scale: v.scale ?? scale }));
-    if (e.altKey || holdingSpace.current || (!within && !painting) || (painting && p.geometryLocked) || p.compare || p.tool === 'transform') {
+    if (e.altKey || holdingSpace.current || (!within && !painting) || (painting && p.geometryLocked) || p.compare || (p.tool === 'transform' && !layerBrush)) {
       gesture.current = { ...context(e.pointerId), kind: 'pan', start: { x: e.clientX, y: e.clientY }, origin: view.pan };
+    } else if (layerBrush && within) {
+      p.onInteractionStart();
+      const rect = wrap.current!.getBoundingClientRect();
+      const point = layerPoint(e, rect);
+      const diameter = Math.max(1, layerBrush.size);
+      const g: Extract<Gesture, {kind: 'layer'}> = {
+        ...context(e.pointerId), kind: 'layer', brush: layerBrush,
+        stroke: beginLayerBrush(layerBrush.mask, p.settings), last: point,
+        radius: {x: diameter / (2 * rect.width), y: diameter / (2 * rect.height)}, due: 0,
+      };
+      gesture.current = g;
+      placeBrushCursor(e);
+      drawLayerSegment(g, point);
     } else if (painting && within) {
       p.onInteractionStart();
       const point = maskPoint(e), data = new Float32Array(p.mask);
@@ -246,6 +347,7 @@ export default function CanvasEditor(p: Props) {
     stage.current?.setPointerCapture(e.pointerId);
   }
   function move(e: ReactPointerEvent<HTMLDivElement>) {
+    placeBrushCursor(e);
     if (pointers.current.has(e.pointerId)) pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
     const pin = pinch.current;
     if (pin) {
@@ -257,6 +359,11 @@ export default function CanvasEditor(p: Props) {
       return;
     }
     const g = gesture.current; if (!g || g.pointerId !== e.pointerId) return;
+    if (g.kind === 'layer') {
+      const rect = wrap.current!.getBoundingClientRect();
+      drawLayerSegment(g, layerPoint(e, rect));
+      return;
+    }
     if (g.kind === 'paint') { draw(g, maskPoint(e)); return; }
     if (g.kind === 'pan') { setView(v => ({ ...v, pan: { x: g.origin.x + e.clientX - g.start.x, y: g.origin.y + e.clientY - g.start.y } })); return; }
     if (g.kind === 'local') {
@@ -275,7 +382,16 @@ export default function CanvasEditor(p: Props) {
     }
     const g = gesture.current; if (!g || g.pointerId !== e.pointerId) return;
     move(e); gesture.current = null; setResizeOffset({ x: 0, y: 0 }); setPushPreview(null); release(e.pointerId);
-    if (g.kind === 'paint' && g.data.some((value, i) => value !== g.base[i])) p.onMask(g.data);
+    if (g.kind === 'layer') {
+      window.clearTimeout(g.timer);
+      if (e.pointerType !== 'mouse') hideBrushCursor();
+      if (g.stroke.mask.data.some((value, index) => value !== g.stroke.base[index])) {
+        p.onLayerBrushCommit?.(g.brush.layerId, g.stroke.mask);
+      } else {
+        p.onLayerBrushPreview?.(g.brush.layerId, null);
+      }
+    }
+    else if (g.kind === 'paint' && g.data.some((value, i) => value !== g.base[i])) p.onMask(g.data);
     else if (g.kind === 'resize') {
       setView({ scale: g.scale, pan: { x: g.origin.x + g.shift.x, y: g.origin.y + g.shift.y } }); p.onChange(g.last, true);
     } else if (g.kind === 'local') {
@@ -299,8 +415,8 @@ export default function CanvasEditor(p: Props) {
   function fitView() { cancelAll(true); resizeRestore.current = null; setView({ scale: null, pan: { x: 0, y: 0 } }); }
   const focus = p.localFocus;
   return <>
-    <div ref={stage} className={`canvas-stage niuniu-canvas${local ? ' is-local-editing' : ''}`} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={cancel} onLostPointerCapture={cancel}>
-      <div ref={wrap} className={`canvas-wrap${!original && !local && !p.effectMode && !p.geometryLocked ? ' has-handles' : ''}${painting && !p.geometryLocked ? ' is-painting' : ''}`} style={{ width: width * scale, height: height * scale, transform: `translate(${shownPan.x}px, ${shownPan.y}px)` }}>
+    <div ref={stage} className={`canvas-stage niuniu-canvas${local ? ' is-local-editing' : ''}`} onPointerDown={down} onPointerMove={move} onPointerLeave={hideBrushCursor} onPointerUp={up} onPointerCancel={cancel} onLostPointerCapture={cancel}>
+      <div ref={wrap} className={`canvas-wrap${!original && !local && !p.effectMode && !p.geometryLocked ? ' has-handles' : ''}${painting && !p.geometryLocked ? ' is-painting' : ''}${layerBrush ? ' is-layer-painting' : ''}`} style={{ width: width * scale, height: height * scale, transform: `translate(${shownPan.x}px, ${shownPan.y}px)` }}>
         <canvas ref={pixels} className="canvas-image" aria-label={original ? '原始图片' : '编辑结果'} role="img" />
         {painting && <canvas ref={overlay} className="mask-canvas" style={{ opacity: p.showMask ? 1 : 0 }} aria-label={p.geometryLocked ? '保护选区（已锁定）' : '区域绘制画布'} />}
         {!original && !local && !p.effectMode && !p.geometryLocked && RESIZE_HANDLES.map(handle => <button key={handle.id} className={`resize-handle ${handle.id}`} aria-label={handle.label} title={`${handle.label} · 方向键微调`} onPointerDown={e => resize(e, handle.id)} onKeyDown={e => resizeKey(e, handle.id)} />)}
@@ -313,12 +429,17 @@ export default function CanvasEditor(p: Props) {
         </>}
         <span className="canvas-size-label">{width} × {height}</span>
       </div>
-      {painting ? <div className={`canvas-message ${p.tool === 'compress' ? 'compress' : 'protect'}`}><Icon name={p.tool === 'erase' ? 'eraser' : 'shield'} size={14} /><span>原图选区 · {p.geometryLocked ? '重置局部后可编辑保护' : p.tool === 'protect' ? '保护主体' : p.tool === 'compress' ? '优先压缩' : p.tool === 'erase' ? '柔和擦除' : '框选保护'}</span><button className="text-button" onClick={p.onDone}>查看结果</button></div>
+      {layerBrush && <div ref={brushCursor} className="layer-brush-cursor" hidden aria-hidden="true"
+        style={{width: layerBrush.size, height: layerBrush.size}} />}
+      {layerBrush ? <div className="canvas-message layer-brush-message">
+        <Icon name="brush" size={14}/><span>{layerBrush.mode === 'erase' ? '擦除当前效果层' : '恢复当前效果层'}</span>
+        {p.onLayerBrushDone && <button className="text-button" onClick={p.onLayerBrushDone}>完成</button>}
+      </div> : painting ? <div className={`canvas-message ${p.tool === 'compress' ? 'compress' : 'protect'}`}><Icon name={p.tool === 'erase' ? 'eraser' : 'shield'} size={14} /><span>原图选区 · {p.geometryLocked ? '重置局部后可编辑保护' : p.tool === 'protect' ? '保护主体' : p.tool === 'compress' ? '优先压缩' : p.tool === 'erase' ? '柔和擦除' : '框选保护'}</span><button className="text-button" onClick={p.onDone}>查看结果</button></div>
         : p.compare ? <div className="canvas-badge"><Icon name="compare" size={14} />正在查看原图</div>
         : p.effectMode ? null : local ? <div className="canvas-badge local-instruction">{p.localMode === 'push' ? '拖动推拉 · 双指移动视图' : '点选部位或图片 · 调整局部比例'}</div>
         : <div className="canvas-badge"><span className="local-indicator">{p.geometryLocked ? '已有局部塑形 · 整体尺寸已锁定' : '拖动四边与四角调整画布'}</span></div>}
-      {p.busy && <div className="progress" role="status"><span className="spinner" /><span>{p.progress.label || '正在处理'}</span><div className="progress-track"><div className="progress-bar" style={{ width: `${Math.max(3, p.progress.value * 100)}%` }} /></div></div>}
+      {p.busy && !layerBrush && <div className="progress" role="status"><span className="spinner" /><span>{p.progress.label || '正在处理'}</span><div className="progress-track"><div className="progress-bar" style={{ width: `${Math.max(3, p.progress.value * 100)}%` }} /></div></div>}
     </div>
-    <div className="statusbar"><span className="status-text">{painting ? p.geometryLocked ? '原图选区已锁定 · 可平移查看' : '原图标记 · 绿色保护 · 橙色压缩' : local ? '双指缩放平移 · 空格拖动平移' : p.effectMode ? '效果预览 · 双指缩放平移' : p.result?.warnings[0] || '八向调整尺寸 · 双指缩放平移'}</span><div className="zoom-controls" role="group" aria-label="画布缩放"><button className="btn-icon" title="缩小视图" aria-label="缩小视图" disabled={scale <= .005} onClick={() => changeZoom(1 / 1.25)}><Icon name="minus" size={15} /></button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="btn-icon" title="放大视图" aria-label="放大视图" disabled={scale >= 8} onClick={() => changeZoom(1.25)}><Icon name="plus" size={15} /></button><button className="btn-icon" title="适应窗口" aria-label="适应窗口" onClick={fitView}><Icon name="fit" size={16} /></button></div></div>
+    <div className="statusbar"><span className="status-text">{layerBrush ? '单指涂抹 · 双指缩放平移' : painting ? p.geometryLocked ? '原图选区已锁定 · 可平移查看' : '原图标记 · 绿色保护 · 橙色压缩' : local ? '双指缩放平移 · 空格拖动平移' : p.effectMode ? '效果预览 · 双指缩放平移' : p.result?.warnings[0] || '八向调整尺寸 · 双指缩放平移'}</span><div className="zoom-controls" role="group" aria-label="画布缩放"><button className="btn-icon" title="缩小视图" aria-label="缩小视图" disabled={scale <= .005} onClick={() => changeZoom(1 / 1.25)}><Icon name="minus" size={15} /></button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="btn-icon" title="放大视图" aria-label="放大视图" disabled={scale >= 8} onClick={() => changeZoom(1.25)}><Icon name="plus" size={15} /></button><button className="btn-icon" title="适应窗口" aria-label="适应窗口" onClick={fitView}><Icon name="fit" size={16} /></button></div></div>
   </>;
 }
