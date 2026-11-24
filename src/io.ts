@@ -1,8 +1,12 @@
 import type { PixelImage } from './types';
 
-export const MAX_OUTPUT_PIXELS = 24_000_000;
+import { MAX_OUTPUT_PIXELS, type PixelSize } from './exportSize';
+export { MAX_OUTPUT_PIXELS } from './exportSize';
 export const MAX_PROJECT_BYTES = 75 * 1024 * 1024;
-const MAX_SOURCE_PIXELS = 40_000_000;
+const MAX_WORKING_PIXELS = 12_000_000;
+const MAX_WORKING_EDGE = 8192;
+const MAX_IMPORT_BYTES = 256 * 1024 * 1024;
+const MAX_EMBEDDED_IMAGE_BYTES = 50 * 1024 * 1024;
 
 /** Preserve the aspect ratio until the minimum 32px edge makes that impossible. */
 export function defaultOutputSize(width: number, height: number) {
@@ -14,26 +18,83 @@ export function isImageDataURL(value: string): boolean {
   return /^data:image\/(?:jpeg|png|webp|gif|avif|bmp);base64,[a-z0-9+/]+={0,2}$/i.test(value);
 }
 
-export async function decodeImage(url: string): Promise<PixelImage> {
-  const image = new Image();
-  image.src = url;
-  try { await image.decode(); }
-  catch { throw new Error('图片无法解码，请使用浏览器支持的 JPG、PNG、WebP、AVIF 或 GIF 图片。'); }
-  if (!image.naturalWidth || !image.naturalHeight || image.naturalWidth * image.naturalHeight > MAX_SOURCE_PIXELS) {
-    throw new Error('图片过大，请使用 4000 万像素以内的图片。');
-  }
-  const canvas = document.createElement('canvas');
-  canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) throw new Error('无法创建图片画布，请缩小图片后重试。');
-  try {
-    ctx.drawImage(image, 0, 0);
-    return { width: canvas.width, height: canvas.height, data: ctx.getImageData(0, 0, canvas.width, canvas.height).data };
-  } catch { throw new Error('无法读取图片像素，请使用本地图片，或缩小图片后重试。'); }
+export function workingImageSize(original: PixelSize): PixelSize {
+  const scale = Math.min(1, MAX_WORKING_EDGE / Math.max(original.width, original.height),
+    Math.sqrt(MAX_WORKING_PIXELS / (original.width * original.height)));
+  return {
+    width: Math.max(1, Math.floor(original.width * scale)),
+    height: Math.max(1, Math.floor(original.height * scale)),
+  };
 }
 
-export function readDataURL(file: File): Promise<string> {
-  if (file.size > 50 * 1024 * 1024) return Promise.reject(new Error('文件过大，请选择小于 50 MB 的图片。'));
+function openImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('浏览器无法读取这张图片。请尝试 JPG、PNG 或 WebP 格式，或缩小源图片。'));
+    image.src = url;
+  });
+}
+
+function canvasToPNG(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => blob?.size
+      ? resolve(blob)
+      : reject(new Error('浏览器内存不足，PNG 未生成。请选择较小的像素尺寸重试。')), 'image/png');
+  });
+}
+
+/** Large files are opened from a temporary URL. Only the bounded working copy is
+ * read to RGBA and embedded in a new project; existing project pixels stay exact. */
+export async function loadImageSource(input: string | File, options: {legacyProject?: boolean} = {}) {
+  const file = typeof input === 'string' ? undefined : input;
+  if (file && file.size > MAX_IMPORT_BYTES) throw new Error('单个图片文件最多 256 MiB，请先压缩文件后打开。');
+  const url = typeof input === 'string' ? input : URL.createObjectURL(input);
+  const canvas = document.createElement('canvas');
+  let element: HTMLImageElement | undefined;
+  let bitmap: ImageBitmap | undefined;
+  try {
+    element = await openImage(url);
+    const originalWidth = element.naturalWidth;
+    const originalHeight = element.naturalHeight;
+    if (!originalWidth || !originalHeight) throw new Error('这张图片没有可读取的像素尺寸。');
+    const original = {width: originalWidth, height: originalHeight};
+    const retainLegacyPixels = options.legacyProject && originalWidth * originalHeight <= 40_000_000;
+    const size = retainLegacyPixels ? original : workingImageSize(original);
+    const adapted = size.width !== originalWidth || size.height !== originalHeight;
+    canvas.width = size.width;
+    canvas.height = size.height;
+    const context = canvas.getContext('2d', {willReadFrequently: true});
+    if (!context) throw new Error('无法创建工作画布，请缩小源图片后重试。');
+    // Supply a resize hint to the browser's decoder where available. The canvas
+    // fallback is also sized before drawing, so it never allocates a full-size raster.
+    if (adapted && file && typeof createImageBitmap === 'function') {
+      try { bitmap = await createImageBitmap(file, {resizeWidth: size.width, resizeHeight: size.height, resizeQuality: 'high'}); }
+      catch { /* Browsers differ in bitmap decoder/format support. */ }
+    }
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(bitmap ?? element, 0, 0, size.width, size.height);
+    bitmap?.close();
+    bitmap = undefined;
+    const image: PixelImage = {...size, data: context.getImageData(0, 0, size.width, size.height).data};
+    let persistentURL: string;
+    if (!adapted && typeof input === 'string' && isImageDataURL(input)) persistentURL = input;
+    else if (!adapted && file && file.size <= MAX_EMBEDDED_IMAGE_BYTES &&
+      /^image\/(jpeg|png|webp|gif|avif|bmp)$/i.test(file.type)) persistentURL = await readDataURL(file);
+    else persistentURL = await readDataURL(await canvasToPNG(canvas));
+    if (!isImageDataURL(persistentURL)) throw new Error('无法保存工作图片，请换用 JPG、PNG 或 WebP。');
+    return {image, url: persistentURL, originalWidth, originalHeight, adapted};
+  } finally {
+    bitmap?.close();
+    canvas.width = canvas.height = 0;
+    element?.removeAttribute('src');
+    if (file) URL.revokeObjectURL(url);
+  }
+}
+
+export function readDataURL(file: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result));
@@ -51,8 +112,17 @@ export function imageToCanvas(image: PixelImage): HTMLCanvasElement {
   canvas.width = image.width; canvas.height = image.height;
   const context = canvas.getContext('2d');
   if (!context) throw new Error('无法创建导出画布，请调小输出尺寸。');
-  context.putImageData(new ImageData(new Uint8ClampedArray(image.data), image.width, image.height), 0, 0);
+  const pixels = image.data.buffer instanceof ArrayBuffer
+    ? new Uint8ClampedArray(image.data.buffer, image.data.byteOffset, image.data.length)
+    : new Uint8ClampedArray(image.data);
+  context.putImageData(new ImageData(pixels, image.width, image.height), 0, 0);
   return canvas;
+}
+
+export async function imageToPNGBlob(image: PixelImage): Promise<Blob> {
+  const canvas = imageToCanvas(image);
+  try { return await canvasToPNG(canvas); }
+  finally { canvas.width = canvas.height = 0; }
 }
 
 export function encodeMask(mask: Float32Array): string {

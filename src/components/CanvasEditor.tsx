@@ -9,6 +9,7 @@ import './canvas-improvements.css';
 
 export interface LocalCanvasTarget { id: string; label: string; cx: number; cy: number; rx: number; ry: number; angle: number }
 interface Props {
+  effectMode?: boolean;
   source: SourceImage; settings: EditSettings; result: RenderResult | null; tool: Tool;
   mask: Float32Array; maskSize: { width: number; height: number }; brushSize: number; brushHardness?: number; showMask: boolean;
   compare: boolean; locked: boolean; geometryLocked?: boolean; busy: boolean; progress: { value: number; label: string };
@@ -299,10 +300,10 @@ export default function CanvasEditor(p: Props) {
   const focus = p.localFocus;
   return <>
     <div ref={stage} className={`canvas-stage niuniu-canvas${local ? ' is-local-editing' : ''}`} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={cancel} onLostPointerCapture={cancel}>
-      <div ref={wrap} className={`canvas-wrap${!original && !local && !p.geometryLocked ? ' has-handles' : ''}${painting && !p.geometryLocked ? ' is-painting' : ''}`} style={{ width: width * scale, height: height * scale, transform: `translate(${shownPan.x}px, ${shownPan.y}px)` }}>
+      <div ref={wrap} className={`canvas-wrap${!original && !local && !p.effectMode && !p.geometryLocked ? ' has-handles' : ''}${painting && !p.geometryLocked ? ' is-painting' : ''}`} style={{ width: width * scale, height: height * scale, transform: `translate(${shownPan.x}px, ${shownPan.y}px)` }}>
         <canvas ref={pixels} className="canvas-image" aria-label={original ? '原始图片' : '编辑结果'} role="img" />
         {painting && <canvas ref={overlay} className="mask-canvas" style={{ opacity: p.showMask ? 1 : 0 }} aria-label={p.geometryLocked ? '保护选区（已锁定）' : '区域绘制画布'} />}
-        {!original && !local && !p.geometryLocked && RESIZE_HANDLES.map(handle => <button key={handle.id} className={`resize-handle ${handle.id}`} aria-label={handle.label} title={`${handle.label} · 方向键微调`} onPointerDown={e => resize(e, handle.id)} onKeyDown={e => resizeKey(e, handle.id)} />)}
+        {!original && !local && !p.effectMode && !p.geometryLocked && RESIZE_HANDLES.map(handle => <button key={handle.id} className={`resize-handle ${handle.id}`} aria-label={handle.label} title={`${handle.label} · 方向键微调`} onPointerDown={e => resize(e, handle.id)} onKeyDown={e => resizeKey(e, handle.id)} />)}
         {local && <>
           <svg className="local-focus-overlay" viewBox={`0 0 ${width} ${height}`} aria-hidden="true">
             {focus && <ellipse cx={focus.cx * width} cy={focus.cy * height} rx={focus.rx * width} ry={focus.ry * height} transform={`rotate(${focus.angle * 180 / Math.PI} ${focus.cx * width} ${focus.cy * height})`} />}
@@ -314,10 +315,10 @@ export default function CanvasEditor(p: Props) {
       </div>
       {painting ? <div className={`canvas-message ${p.tool === 'compress' ? 'compress' : 'protect'}`}><Icon name={p.tool === 'erase' ? 'eraser' : 'shield'} size={14} /><span>原图选区 · {p.geometryLocked ? '重置局部后可编辑保护' : p.tool === 'protect' ? '保护主体' : p.tool === 'compress' ? '优先压缩' : p.tool === 'erase' ? '柔和擦除' : '框选保护'}</span><button className="text-button" onClick={p.onDone}>查看结果</button></div>
         : p.compare ? <div className="canvas-badge"><Icon name="compare" size={14} />正在查看原图</div>
-        : local ? <div className="canvas-badge local-instruction">{p.localMode === 'push' ? '拖动推拉 · 双指移动视图' : '点选部位或图片 · 调整局部比例'}</div>
+        : p.effectMode ? null : local ? <div className="canvas-badge local-instruction">{p.localMode === 'push' ? '拖动推拉 · 双指移动视图' : '点选部位或图片 · 调整局部比例'}</div>
         : <div className="canvas-badge"><span className="local-indicator">{p.geometryLocked ? '已有局部塑形 · 整体尺寸已锁定' : '拖动四边与四角调整画布'}</span></div>}
       {p.busy && <div className="progress" role="status"><span className="spinner" /><span>{p.progress.label || '正在处理'}</span><div className="progress-track"><div className="progress-bar" style={{ width: `${Math.max(3, p.progress.value * 100)}%` }} /></div></div>}
     </div>
-    <div className="statusbar"><span className="status-text">{painting ? p.geometryLocked ? '原图选区已锁定 · 可平移查看' : '原图标记 · 绿色保护 · 橙色压缩' : local ? '双指缩放平移 · 空格拖动平移' : p.result?.warnings[0] || '八向调整尺寸 · 双指缩放平移'}</span><div className="zoom-controls" role="group" aria-label="画布缩放"><button className="btn-icon" title="缩小视图" aria-label="缩小视图" disabled={scale <= .005} onClick={() => changeZoom(1 / 1.25)}><Icon name="minus" size={15} /></button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="btn-icon" title="放大视图" aria-label="放大视图" disabled={scale >= 8} onClick={() => changeZoom(1.25)}><Icon name="plus" size={15} /></button><button className="btn-icon" title="适应窗口" aria-label="适应窗口" onClick={fitView}><Icon name="fit" size={16} /></button></div></div>
+    <div className="statusbar"><span className="status-text">{painting ? p.geometryLocked ? '原图选区已锁定 · 可平移查看' : '原图标记 · 绿色保护 · 橙色压缩' : local ? '双指缩放平移 · 空格拖动平移' : p.effectMode ? '效果预览 · 双指缩放平移' : p.result?.warnings[0] || '八向调整尺寸 · 双指缩放平移'}</span><div className="zoom-controls" role="group" aria-label="画布缩放"><button className="btn-icon" title="缩小视图" aria-label="缩小视图" disabled={scale <= .005} onClick={() => changeZoom(1 / 1.25)}><Icon name="minus" size={15} /></button><span className="zoom-value">{Math.round(scale * 100)}%</span><button className="btn-icon" title="放大视图" aria-label="放大视图" disabled={scale >= 8} onClick={() => changeZoom(1.25)}><Icon name="plus" size={15} /></button><button className="btn-icon" title="适应窗口" aria-label="适应窗口" onClick={fitView}><Icon name="fit" size={16} /></button></div></div>
   </>;
 }

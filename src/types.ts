@@ -1,4 +1,7 @@
+import type { EffectSettings } from './effects/catalog';
 import type { LocalEdit } from './localTypes';
+// The shape is stored in logical coordinates. Exported pixels have a separate budget.
+export const MAX_CANVAS_EDGE = 32768;
 export type ShapeId = 'rect' | 'ellipse' | 'triangle' | 'diamond' | 'hexagon' | 'star' | 'heart';
 export type Tool = 'transform' | 'local' | 'protect' | 'compress' | 'erase' | 'rectangle';
 export type Quality = 'draft' | 'balanced' | 'fine';
@@ -21,6 +24,8 @@ export interface RenderRequest {
   maskHeight: number;
   settings: EditSettings;
   maxOutputEdge?: number;
+  outputSize?: {width:number;height:number};
+  effect?: EffectSettings | null;
   localEdits?: LocalEdit[];
 }
 export interface RenderResult {

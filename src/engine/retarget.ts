@@ -1,3 +1,4 @@
+import { validateExportSize } from '../exportSize';
 import type { PixelImage, RenderRequest, RenderResult, ShapeId } from '../types';
 import { featherProtection, softenMonotoneMap } from './softenMap';
 import { createLocalMapper } from './localWarp';
@@ -293,13 +294,17 @@ export function renderImage(request: RenderRequest, onProgress?: (progress: numb
     || image.data.length !== image.width * image.height * 4) throw new Error('图片像素数据或尺寸无效。');
   if (!Number.isFinite(settings.width) || !Number.isFinite(settings.height) || settings.width < 1 || settings.height < 1)
     throw new Error('输出宽高必须是大于 0 的数字。');
-  let outputWidth = Math.max(1, Math.round(settings.width)), outputHeight = Math.max(1, Math.round(settings.height));
-  if (request.maxOutputEdge && Number.isFinite(request.maxOutputEdge) && request.maxOutputEdge > 0) {
+  // The seam ratios and rotated local edits use the logical canvas dimensions.
+  // Only raster allocation, scanline coverage and sampling density use file dimensions.
+  const rasterSize = request.outputSize ?? settings;
+  let outputWidth = rasterSize.width;
+  let outputHeight = rasterSize.height;
+  if (!request.outputSize && request.maxOutputEdge && Number.isFinite(request.maxOutputEdge) && request.maxOutputEdge > 0) {
     const scale = Math.min(1, request.maxOutputEdge / Math.max(outputWidth, outputHeight));
     outputWidth = Math.max(1, Math.round(outputWidth * scale)); outputHeight = Math.max(1, Math.round(outputHeight * scale));
   }
-  if (outputWidth * outputHeight > 40_000_000 || outputWidth > 16384 || outputHeight > 16384)
-    throw new Error('输出过大，请将尺寸调整到 4000 万像素以内，且单边不超过 16384 像素。');
+  const sizeError = validateExportSize({ width: outputWidth, height: outputHeight });
+  if (sizeError) throw new Error(sizeError);
   const warnings: string[] = [], amount = clamp(finite(settings.contentAmount, 1), 0, 1);
   const strength = clamp(finite(settings.protectStrength, 1), 0, 3), edge = LIMITS[settings.quality] || LIMITS.balanced;
   const softness = clamp(finite(settings.transitionSoftness, 0), 0, 1);

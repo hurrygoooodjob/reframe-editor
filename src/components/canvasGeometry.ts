@@ -1,3 +1,5 @@
+import { MAX_CANVAS_EDGE } from '../types';
+
 export interface Point { x: number; y: number }
 export type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
 
@@ -17,11 +19,11 @@ export function resizeGeometry(width: number, height: number, handle: ResizeHand
   if (locked) {
     const factor = sx === 0 ? h / height : sy === 0 ? w / width
       : Math.abs(w / width - 1) >= Math.abs(h / height - 1) ? w / width : h / height;
-    const bounded = Math.max(Math.max(32 / width, 32 / height), Math.min(Math.min(8192 / width, 8192 / height), factor));
+    const bounded = Math.max(Math.max(32 / width, 32 / height), Math.min(Math.min(MAX_CANVAS_EDGE / width, MAX_CANVAS_EDGE / height), factor));
     w = width * bounded; h = height * bounded;
   }
-  w = Math.round(Math.max(32, Math.min(8192, w)));
-  h = Math.round(Math.max(32, Math.min(8192, h)));
+  w = Math.round(Math.max(32, Math.min(MAX_CANVAS_EDGE, w)));
+  h = Math.round(Math.max(32, Math.min(MAX_CANVAS_EDGE, h)));
   return { width: w, height: h, shift: { x: sx * (w - width) * safeScale / 2, y: sy * (h - height) * safeScale / 2 } };
 }
 

@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, KeyboardEvent, ReactNode } from 'react';
-import { SHAPES } from '../types';
+import { SHAPES, MAX_CANVAS_EDGE } from '../types';
 import type { EditSettings, Quality } from '../types';
 import Icon from './Icon';
 
 export interface InspectorProps {
   autoControls?: ReactNode;
-  mode: 'shape' | 'local' | 'selection' | 'project';
+  mode: 'shape' | 'local' | 'selection' | 'effect' | 'project';
+  effectControls?: ReactNode;
   localControls?: ReactNode;
   brushHardness: number;
   onBrushHardnessChange:(value:number)=>void;
@@ -33,7 +34,7 @@ export interface InspectorProps {
 }
 
 const MIN_SIZE = 32;
-const MAX_SIZE = 8192;
+const MAX_SIZE = MAX_CANVAS_EDGE;
 const boundSize = (value: number) => Math.max(MIN_SIZE, Math.min(MAX_SIZE, Math.round(value)));
 const rangeStyle = (value: number, min = 0, max = 1) => ({ '--range-progress': `${100 * (value - min) / (max - min)}%` } as CSSProperties);
 
@@ -134,10 +135,11 @@ export default function Inspector(props: InspectorProps) {
   const selectedRatio = settings.width / settings.height;
   const ratios = [{ label: '原始', ratio: originalSize.width / originalSize.height }, { label: '1:1', ratio: 1 }, { label: '4:5', ratio: 4 / 5 }, { label: '16:9', ratio: 16 / 9 }];
 
-  const title = props.mode === 'shape' ? '整体调整' : props.mode === 'local' ? '局部塑形' : props.mode === 'selection' ? '保护与压缩' : '工程与输出';
+  const title = props.mode === 'shape' ? '整体调整' : props.mode === 'local' ? '局部塑形' : props.mode === 'selection' ? '保护与压缩' : props.mode === 'effect' ? '图片效果' : '工程与输出';
   return <aside className={`inspector inspector-${props.mode}`} aria-label="图片编辑属性">
     <div className="inspector-title"><h2>{title}</h2><span className="inspector-eyebrow">本地处理</span><button className="panel-close" aria-label="收起设置面板" onClick={props.onClose}><Icon name="chevron" size={18}/><span>收起</span></button></div>
     <div ref={scroll} className="inspector-scroll">
+    {props.mode === 'effect' && props.effectControls}
     {props.mode === 'local' && props.localControls}
     {props.mode === 'shape' && props.autoControls}
     {props.mode === 'shape' && <fieldset className="controls-fieldset" disabled={busy}>
@@ -183,10 +185,10 @@ export default function Inspector(props: InspectorProps) {
     {props.mode === 'project' && <section className="section output-section" aria-labelledby="output-heading">
       <div className="section-heading"><h2 id="output-heading">输出设置</h2><span className="section-meta">PNG · 透明背景</span></div>
       <div className="grouped-card"><label className="select-field"><span>计算精度</span><select value={settings.quality} aria-label="计算精度" onChange={(event) => patch({ quality: event.currentTarget.value as Quality })}><option value="draft">快速</option><option value="balanced">均衡 · 推荐</option><option value="fine">精细</option></select><Icon name="chevron" size={15}/></label></div>
-      <p className="field-note">精细模式保留更多结构，计算时间会增加。导出始终从原图采样。</p>
+      <p className="field-note">精细模式保留更多结构，计算时间会增加。导出时可单独指定成片尺寸。</p>
       <div className="section-heading"><h2>继续编辑</h2></div>
       <div className="project-actions"><button className="btn" onClick={onSaveProject} disabled={busy}><Icon name="save" size={16}/>保存工程</button><button className="btn" onClick={onLoadProject}><Icon name="open" size={16}/>打开工程</button></div>
-      <p className="field-note">工程包含原图、参数和选区。关闭页面前保存，下次打开即可继续。</p>
+      <p className="field-note">工程包含工作图片、效果、参数和选区。关闭页面前保存，下次打开即可继续。</p>
       <button className="reset-button" onClick={onReset}><Icon name="reset" size={16}/><span>还原所有编辑</span></button>
     </section>}
     <div className="inspector-footer"><Icon name="shield" size={14}/><span>图片仅在你的设备中处理</span></div>

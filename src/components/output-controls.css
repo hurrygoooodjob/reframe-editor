@@ -1,0 +1,23 @@
+.output-size-dialog { margin: auto; color: var(--text); }
+.output-size-dialog::backdrop { background: #121c2b8c; backdrop-filter: blur(3px); }
+.output-size-dialog .output-canvas-size { display: flex; gap: 10px; align-items: baseline; margin: 0 0 12px; }
+.output-canvas-size strong { color: #344a65; font-variant-numeric: tabular-nums; }
+.output-presets { display: flex; flex-wrap: wrap; gap: 5px; }
+.output-presets button, .output-lock { min-height: 38px; padding: 6px 10px; color: #3c526e; border: 1px solid #9eabba; background: var(--silver); box-shadow: inset 0 1px #fff; border-radius: 6px; font-size: 12px; }
+.output-presets [aria-pressed=true], .output-lock[aria-pressed=true] { color: #fff; border-color: #3d6797; background: linear-gradient(#789bc5,#496f9f); box-shadow: inset 0 1px #b4cde9; text-shadow: 0 -1px #3c5777; }
+.output-presets button:disabled { opacity: .45; }
+.output-dimensions { display: grid; grid-template-columns: minmax(0,1fr) 44px minmax(0,1fr); align-items: end; gap: 8px; margin-top: 20px; }
+.output-dimensions label { color: #40516a; font-weight: 650; font-size: 12px; text-shadow: 0 1px #fff; }
+.output-dimensions label span { margin-left: 3px; color: #6b7788; font-weight: 400; }
+.output-dimensions input { margin-top: 6px; font-variant-numeric: tabular-nums; }
+.output-lock { display: grid; place-items: center; }
+.output-size-dialog .output-size-message { margin: 8px 0 18px; min-height: 1.8em; }
+.output-size-dialog .output-size-message.has-error { color: #96352a; }
+.output-result { display: flex; align-items: baseline; gap: 10px; padding-top: 12px; border-top: 1px solid #b4bfcd; text-shadow: 0 1px #fff; font-size: 13px; color: #506279; }
+.output-result strong { margin-left: auto; color: #293d59; font-variant-numeric: tabular-nums; }
+.output-size-dialog .dialog-actions { margin-top: 10px; }
+.output-size-dialog .dialog-actions .btn { margin-top: 0; }
+@media (max-width: 760px) {
+  .dialog.output-size-dialog { width: min(480px, calc(100% - 24px)); }
+  .output-presets button, .output-lock, .output-size-dialog .output-dimensions input { min-height: 44px; }
+}

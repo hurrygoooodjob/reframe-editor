@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { DEFAULT_SETTINGS, SHAPES } from '../types';
+import { DEFAULT_SETTINGS, MAX_CANVAS_EDGE, SHAPES } from '../types';
 import type { EditSettings, PixelImage, RenderResult, Tool, AutoSelectionInfo } from '../types';
-import { decodeImage, readDataURL, imageToCanvas, cleanFilename, encodeMask, decodeMask, defaultOutputSize, isImageDataURL, MAX_OUTPUT_PIXELS, MAX_PROJECT_BYTES } from '../io';
-import { startRender, startAutoAnalysis } from '../renderClient';
+import { loadImageSource, imageToPNGBlob, cleanFilename, encodeMask, decodeMask, defaultOutputSize, isImageDataURL, MAX_PROJECT_BYTES } from '../io';
+import { normalizeEffect, type EffectSettings } from '../effects/catalog';
+import { validateExportSize, type PixelSize } from '../exportSize';
+import { startEffect, startRender, startAutoAnalysis } from '../renderClient';
 import { parseLocalEdits, normalizeLocalEdit, MAX_LOCAL_EDITS } from '../localTypes';
 import type { LocalEdit } from '../localTypes';
 import { detectParts, cancelDetection } from '../vision/client';
@@ -11,10 +13,14 @@ import { createRandomPlan } from '../autoPlan';
 import { emptyMaskOverrides, hasMaskOverrides, updateMaskOverrides, applyMaskOverrides, encodeMaskOverrides, decodeMaskOverrides } from '../maskOverrides';
 
 export interface SourceImage { image: PixelImage; url: string; name: string; }
-interface Snapshot { settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; localEdits: LocalEdit[]; manualOverrides: Float32Array; }
-interface RestoredProject { settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; localEdits?: LocalEdit[]; manualOverrides: Float32Array; }
+interface Snapshot { effect: EffectSettings | null; settings: EditSettings; mask: Float32Array; autoInfo: AutoSelectionInfo | null; localEdits: LocalEdit[]; manualOverrides: Float32Array; }
+interface RestoredProject { legacyProject:boolean; effect: EffectSettings | null; settings: EditSettings; mask: Float32Array; maskSize: {width:number;height:number}; localEdits?: LocalEdit[]; manualOverrides: Float32Array; }
 const isCancelled = (error: unknown) => error instanceof Error && error.name === 'AbortError';
 export function useEditor() {
+  const [effect, setEffect] = useState<EffectSettings | null>(null);
+  const effectRef = useRef<EffectSettings | null>(null);
+  const [effectPreview, setEffectPreview] = useState<RenderResult | null>(null);
+  const [effectBusy, setEffectBusy] = useState(false);
   const [localEdits,setLocalEdits]=useState<LocalEdit[]>([]);
   const localRef=useRef<LocalEdit[]>([]);
   const manualOverrides=useRef<Float32Array>(emptyMaskOverrides(0));
@@ -53,9 +59,9 @@ export function useEditor() {
   const record = useCallback((nextSettings:EditSettings, nextMask:Float32Array, replace=false) => {
     if (replace) {history.current=[];historyIndex.current=-1;}
     const current=history.current[historyIndex.current];
-    if(current && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current && current.localEdits===localRef.current && current.manualOverrides===manualOverrides.current) return;
+    if(current && JSON.stringify(current.effect)===JSON.stringify(effectRef.current) && JSON.stringify(current.settings)===JSON.stringify(nextSettings) && current.mask===nextMask && current.autoInfo===autoInfoRef.current && current.localEdits===localRef.current && current.manualOverrides===manualOverrides.current) return;
     history.current=history.current.slice(0,historyIndex.current+1);
-    history.current.push({settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current,localEdits:localRef.current,manualOverrides:manualOverrides.current});
+    history.current.push({effect:effectRef.current,settings:{...nextSettings},mask:nextMask,autoInfo:autoInfoRef.current,localEdits:localRef.current,manualOverrides:manualOverrides.current});
     if(history.current.length>30) history.current.shift();
     historyIndex.current=history.current.length-1;syncHistory();
   },[]);
@@ -87,8 +93,9 @@ export function useEditor() {
   }, [cancelExport,cancelAuto]);
 
   // All entry points claim an import token before any FileReader/decode await.
-  const applyImage = useCallback(async (url:string,name:string,token:number,restored?:RestoredProject) => {
-    const image=await decodeImage(url);
+  const applyImage = useCallback(async (input:string|File,name:string,token:number,restored?:RestoredProject) => {
+    const loaded = await loadImageSource(input, {legacyProject: restored?.legacyProject});
+    const {image, url: persistentURL} = loaded;
     if(token!==importToken.current)return;
     if (restored) {
       const { width, height } = restored.maskSize;
@@ -100,19 +107,19 @@ export function useEditor() {
         throw new Error('工程选区与原图比例不匹配。');
       }
     }
-    // Vite asset/blob URLs are session-specific; persist their decoded pixels.
-    const persistentURL = isImageDataURL(url) ? url : imageToCanvas(image).toDataURL('image/png');
-    if (!isImageDataURL(persistentURL)) throw new Error('无法保存这张图片的像素，请使用较小的本地图片。');
     const scale=Math.min(1,512/Math.max(image.width,image.height));
     const size=restored?.maskSize||{width:Math.max(1,Math.round(image.width*scale)),height:Math.max(1,Math.round(image.height*scale))};
     const nextMask=restored?.mask||new Float32Array(size.width*size.height);
     const nextSettings=restored?.settings||{...DEFAULT_SETTINGS,...defaultOutputSize(image.width,image.height)};
     cancelExport();cancelAuto();setExportImage(null);setProjectFile(null);
+    effectRef.current = restored?.effect ?? null;
+    setEffect(effectRef.current);
+    setEffectPreview(null);
     setSource({image,url:persistentURL,name});setMaskSize(size);setMask(nextMask);setSettings(nextSettings);settingsRef.current=nextSettings;
     localRef.current=restored?.localEdits||[];setLocalEdits(localRef.current);
     manualOverrides.current=restored?.manualOverrides||emptyMaskOverrides(nextMask.length);
     setResult(null);setTool('transform');setAutoInfo(null);record(nextSettings,nextMask,true);
-    notify(restored?'工程已恢复':nextSettings.width!==image.width||nextSettings.height!==image.height?'图片已打开，画布已适配输出尺寸上限':'图片已打开');
+    notify(loaded.adapted ? `已将 ${loaded.originalWidth} × ${loaded.originalHeight} 图片适配为 ${image.width} × ${image.height} 工作副本` : restored?'工程已恢复':nextSettings.width!==image.width||nextSettings.height!==image.height?'图片已打开，画布已适配输出尺寸上限':'图片已打开');
   },[record,notify,cancelExport,cancelAuto,setAutoInfo]);
 
   const loadImage = useCallback(async (url:string,name:string) => {
@@ -126,17 +133,15 @@ export function useEditor() {
     const token=beginImport();
     try{
       if(!/^image\/(jpeg|png|webp|gif|avif|bmp)$/i.test(file.type) && !/\.(jpe?g|png|webp|gif|avif|bmp)$/i.test(file.name))throw new Error('请选择 JPG、PNG、WebP、AVIF 或 GIF 图片。');
-      const url=await readDataURL(file);
-      if(token!==importToken.current)return;
-      await applyImage(url,file.name,token);
+      await applyImage(file,file.name,token);
     }catch(e){if(token===importToken.current)setError(e instanceof Error?e.message:'图片无法读取。');}
   },[beginImport,applyImage]);
 
   const changeSettings = useCallback((patch:Partial<EditSettings>,commit=false)=>{
     cancelAuto();
     const next={...settingsRef.current,...patch};
-    next.width=Math.round(Math.max(32,Math.min(8192,Number(next.width)||32)));
-    next.height=Math.round(Math.max(32,Math.min(8192,Number(next.height)||32)));
+    next.width=Math.round(Math.max(32,Math.min(MAX_CANVAS_EDGE,Number(next.width)||32)));
+    next.height=Math.round(Math.max(32,Math.min(MAX_CANVAS_EDGE,Number(next.height)||32)));
     for (const key of ['contentAmount','transitionSoftness','squeeze','protectStrength'] as const) next[key]=Number.isFinite(next[key])?Math.max(0,Math.min(1,next[key])):settingsRef.current[key];
     settingsRef.current=next;setSettings(next);
     if(commit)record(next,mask);
@@ -155,16 +160,17 @@ export function useEditor() {
   const undo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current<=0)return;
-    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
+    const snap=history.current[--historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);effectRef.current=snap.effect;setEffect(snap.effect);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const redo = useCallback(()=>{
     cancelAuto();
     if(historyIndex.current>=history.current.length-1)return;
-    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
+    const snap=history.current[++historyIndex.current];settingsRef.current=snap.settings;setSettings(snap.settings);setMask(snap.mask);setAutoInfo(snap.autoInfo);effectRef.current=snap.effect;setEffect(snap.effect);localRef.current=snap.localEdits;setLocalEdits(snap.localEdits);manualOverrides.current=snap.manualOverrides;syncHistory();
   },[cancelAuto,setAutoInfo]);
   const reset = useCallback(()=>{
     cancelAuto();setAutoInfo(null);
     if(!source)return;
+    effectRef.current=null;setEffect(null);
     localRef.current=[];setLocalEdits([]);
     manualOverrides.current=emptyMaskOverrides(mask.length);
     const next={...DEFAULT_SETTINGS,...defaultOutputSize(source.image.width,source.image.height)};
@@ -232,36 +238,80 @@ export function useEditor() {
     return()=>{disposed=true;clearTimeout(timer);task?.cancel();};
   },[source,mask,maskSize,settings,localEdits,revision]);
 
-  const exportPNG = useCallback(async()=>{
+  const changeEffect = useCallback((value: EffectSettings | null, commit = true) => {
+    const next = normalizeEffect(value);
+    if (JSON.stringify(next) !== JSON.stringify(effectRef.current)) {
+      effectRef.current = next;
+      setEffect(next);
+    }
+    if (commit) record(settingsRef.current, mask);
+  }, [mask, record]);
+
+  // Changing a filter reuses the last warped preview. Detection always sees the unfiltered image.
+  useEffect(() => {
+    if (!result || !effect) {
+      setEffectPreview(null);
+      setEffectBusy(false);
+      return;
+    }
+    let active = true;
+    let task: ReturnType<typeof startEffect> | undefined;
+    setEffectBusy(true);
+    const timer = setTimeout(async () => {
+      try {
+        task = startEffect({image: result.image, effect, reference: {width:settings.width, height:settings.height}});
+        const image = await task.promise;
+        if (active) setEffectPreview({...result, image});
+      } catch (cause) {
+        if (active && !isCancelled(cause)) {
+          setEffectPreview(null);
+          setError(cause instanceof Error ? cause.message : '效果预览失败，请重试。');
+        }
+      } finally {
+        if (active) setEffectBusy(false);
+      }
+    }, 45);
+    return () => { active = false; clearTimeout(timer); task?.cancel(); };
+  }, [result, effect, settings.width, settings.height]);
+  const displayedResult = effect ? effectPreview ?? result : result;
+
+  const exportPNG = useCallback(async(size: PixelSize)=>{
     if(!source||exportTask.current||autoTask.current)return;
-    if(settings.width*settings.height>MAX_OUTPUT_PIXELS){setError('导出上限为 2400 万像素，请调小宽度或高度。');return;}
+    const invalid = validateExportSize(size);
+    if (invalid) { setError(invalid); return; }
     setExporting(true);setError('');setExportImage(null);setExportProgress({value:0,label:'准备高清导出'});
     let task: ReturnType<typeof startRender> | null = null;
     try{
-      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits},(value,label)=>{
+      task=startRender({image:source.image,mask,maskWidth:maskSize.width,maskHeight:maskSize.height,settings,localEdits,outputSize:size,effect},(value,label)=>{
         if(exportTask.current===task)setExportProgress({value,label});
       });
       exportTask.current=task;
       const output=await task.promise;
       if(exportTask.current!==task)return;
-      const url=imageToCanvas(output.image).toDataURL('image/png');
-      if(!isImageDataURL(url))throw new Error('浏览器无法创建该尺寸的 PNG，请调小宽度或高度。');
-      setExportImage({url,name:`${cleanFilename(source.name)}-Niuniu-${settings.width}x${settings.height}.png`,width:output.image.width,height:output.image.height,warnings:output.warnings});
+      setExportProgress({value:.98, label:'正在编码 PNG'});
+      const blob = await imageToPNGBlob(output.image);
+      if (exportTask.current !== task) return;
+      const url = URL.createObjectURL(blob);
+      const {width, height} = output.image;
+      setExportImage({url, name:`${cleanFilename(source.name)}-Niuniu-${width}x${height}.png`, width, height, warnings:output.warnings});
     }catch(e){if((!task||exportTask.current===task)&&!isCancelled(e))setError(e instanceof Error?e.message:'导出失败');}
     finally{if(exportTask.current===task){setExporting(false);exportTask.current=null;}}
-  },[source,settings,mask,maskSize,localEdits]);
+  },[source,settings,mask,maskSize,localEdits,effect]);
+
+  useEffect(() => () => {
+    if (exportImage) URL.revokeObjectURL(exportImage.url);
+  }, [exportImage]);
 
   const saveProject = useCallback(()=>{
     if(!source)return;
     try {
-      if(settings.width*settings.height>MAX_OUTPUT_PIXELS)throw new Error('工程输出超过 2400 万像素，请调小宽度或高度后保存。');
-      const json=JSON.stringify({format:'niuniu-project',version:2,name:source.name,image:source.url,settings,localEdits,manualOverrides:encodeMaskOverrides(manualOverrides.current),mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
+      const json=JSON.stringify({format:'niuniu-project',version:3,effect,name:source.name,image:source.url,settings,localEdits,manualOverrides:encodeMaskOverrides(manualOverrides.current),mask:{width:maskSize.width,height:maskSize.height,data:encodeMask(mask)}});
       const file=new Blob([json],{type:'application/json'});
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件超过 75 MB，请使用较小的图片。');
       const url=URL.createObjectURL(file);
       setProjectFile({url,name:`${cleanFilename(source.name)}.niuniu.json`});
     } catch(e) { setError(e instanceof Error?e.message:'工程无法保存。'); }
-  },[source,settings,mask,maskSize,localEdits]);
+  },[source,settings,mask,maskSize,localEdits,effect]);
   useEffect(()=>()=>{if(projectFile)URL.revokeObjectURL(projectFile.url);},[projectFile]);
 
   const loadProject = useCallback(async(file:File)=>{
@@ -270,9 +320,9 @@ export function useEditor() {
       if(file.size>MAX_PROJECT_BYTES)throw new Error('工程文件过大，请使用 75 MB 以内的工程。');
       const data=JSON.parse(await file.text());
       if(token!==importToken.current)return;
-      if(!data||!((data.format==='reframe-project'&&data.version===1)||(data.format==='niuniu-project'&&data.version===2))||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的 Niuniu 工程文件。');
+      if(!data||!((data.format==='reframe-project'&&data.version===1)||(data.format==='niuniu-project'&&[2,3].includes(data.version)))||typeof data.image!=='string'||!isImageDataURL(data.image))throw new Error('这不是有效的 Niuniu 工程文件。');
       const s=data.settings;
-      if(!s||!Number.isInteger(s.width)||!Number.isInteger(s.height)||s.width<32||s.height<32||s.width>8192||s.height>8192||s.width*s.height>MAX_OUTPUT_PIXELS||!SHAPES.some(shape=>shape.id===s.shape)||!['draft','balanced','fine'].includes(s.quality))throw new Error('工程参数不完整或输出尺寸超限。');
+      if(!s||!Number.isInteger(s.width)||!Number.isInteger(s.height)||s.width<32||s.height<32||s.width>MAX_CANVAS_EDGE||s.height>MAX_CANVAS_EDGE||!SHAPES.some(shape=>shape.id===s.shape)||!['draft','balanced','fine'].includes(s.quality))throw new Error('工程参数不完整或输出尺寸超限。');
       for(const key of ['contentAmount','squeeze','protectStrength'])if(!Number.isFinite(s[key])||s[key]<0||s[key]>1)throw new Error('工程参数超出范围。');
       // Legacy projects retain their original seam appearance until adjusted.
       const transitionSoftness=s.transitionSoftness===undefined?0:s.transitionSoftness;
@@ -282,12 +332,12 @@ export function useEditor() {
       if(!m||!Number.isInteger(m.width)||!Number.isInteger(m.height)||m.width<1||m.height<1||m.width>1024||m.height>1024||typeof m.data!=='string')throw new Error('工程选区尺寸无效。');
       const restoredSettings: EditSettings={width:s.width,height:s.height,shape:s.shape,quality:s.quality,contentAmount:s.contentAmount,transitionSoftness,squeeze:s.squeeze,protectStrength:s.protectStrength,forwardEnergy:s.forwardEnergy};
       const restoredMask=decodeMask(m.data,m.width*m.height);
-      const restoredOverrides=decodeMaskOverrides(data.version===2?data.manualOverrides:undefined,restoredMask);
-      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{settings:restoredSettings,mask:restoredMask,maskSize:{width:m.width,height:m.height},localEdits:data.version===2?parseLocalEdits(data.localEdits):[],manualOverrides:restoredOverrides});
+      const restoredOverrides=decodeMaskOverrides(data.version>=2?data.manualOverrides:undefined,restoredMask);
+      await applyImage(data.image,typeof data.name==='string'?data.name.slice(0,250):'image.png',token,{legacyProject:true,effect:data.version===3?normalizeEffect(data.effect):null,settings:restoredSettings,mask:restoredMask,maskSize:{width:m.width,height:m.height},localEdits:data.version>=2?parseLocalEdits(data.localEdits):[],manualOverrides:restoredOverrides});
     }catch(e){if(token===importToken.current)setError(e instanceof Error?e.message:'工程无法读取。');}
   },[beginImport,applyImage]);
 
-  return {source,settings,localEdits,updateLocal,addLocal,changeLocal,removeLocal,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
+  return {source,settings,effect,changeEffect,displayedResult,effectBusy,localEdits,updateLocal,addLocal,changeLocal,removeLocal,mask,maskSize,result,tool,setTool:(next:Tool)=>{cancelAuto();setTool(next);},busy,progress,error,setError,toast,notify,
     loadImage,importImage,changeSettings,commitMask,clearMask,undo,redo,historyState,reset,
     autoBusy,autoProgress,autoInfo,cancelAuto,autoAnalyze:()=>automatic(false),randomSqueeze:()=>automatic(true),
     exporting,exportPNG,cancelExport,exportImage,setExportImage,
